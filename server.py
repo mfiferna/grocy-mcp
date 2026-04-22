@@ -1,4 +1,5 @@
 import difflib
+import json
 import os
 from datetime import datetime, timedelta
 from typing import Optional
@@ -798,6 +799,229 @@ def remove_from_shopping_list(product_name: str) -> str:
     for item in to_delete:
         api("delete", f"/objects/shopping_list/{item['id']}")
     return f"Removed '{product_name}' from shopping list."
+
+
+# ---------------------------------------------------------------------------
+# Tools — Nutrition
+# ---------------------------------------------------------------------------
+
+@mcp.tool
+def get_nutrition(product_name: str) -> dict:
+    """Get nutrition info (calories, protein, carbs, fat per 100g) for a product.
+
+    Args:
+        product_name: Name of the product
+    """
+    pid, matches = _find_product(product_name)
+    if not pid:
+        if matches:
+            return {"error": f"Ambiguous: {[m['name'] for m in matches[:5]]}"}
+        return {"error": f"Product '{product_name}' not found."}
+
+    products = api("get", "/objects/products") or []
+    product = next((p for p in products if p["id"] == pid), {})
+
+    userfields = api("get", f"/userfields/products/{pid}") or {}
+
+    return {
+        "product": product.get("name", product_name),
+        "calories_kcal": product.get("calories"),
+        "protein_g": userfields.get("protein_g"),
+        "carbs_g": userfields.get("carbs_g"),
+        "fat_g": userfields.get("fat_g"),
+        "per": "100g",
+    }
+
+
+@mcp.tool
+def set_nutrition(
+    product_name: str,
+    calories_kcal: Optional[float] = None,
+    protein_g: Optional[float] = None,
+    carbs_g: Optional[float] = None,
+    fat_g: Optional[float] = None,
+) -> str:
+    """Set nutrition values (per 100g) for a product.
+
+    Args:
+        product_name: Name of the product
+        calories_kcal: Calories in kcal per 100g
+        protein_g: Protein in grams per 100g
+        carbs_g: Carbohydrates in grams per 100g
+        fat_g: Fat in grams per 100g
+    """
+    pid, matches = _find_product(product_name)
+    if not pid:
+        if matches:
+            return f"Ambiguous: {[m['name'] for m in matches[:5]]}"
+        return f"Product '{product_name}' not found."
+
+    products = api("get", "/objects/products") or []
+    product = next((p for p in products if p["id"] == pid), {})
+
+    if calories_kcal is not None:
+        patch = {**product, "calories": calories_kcal}
+        api("put", f"/objects/products/{pid}", json=patch)
+
+    userfields: dict = {}
+    if protein_g is not None:
+        userfields["protein_g"] = protein_g
+    if carbs_g is not None:
+        userfields["carbs_g"] = carbs_g
+    if fat_g is not None:
+        userfields["fat_g"] = fat_g
+    if userfields:
+        api("put", f"/userfields/products/{pid}", json=userfields)
+
+    parts = []
+    if calories_kcal is not None:
+        parts.append(f"{calories_kcal} kcal")
+    if protein_g is not None:
+        parts.append(f"{protein_g}g protein")
+    if carbs_g is not None:
+        parts.append(f"{carbs_g}g carbs")
+    if fat_g is not None:
+        parts.append(f"{fat_g}g fat")
+    return f"Set nutrition for '{product_name}': {', '.join(parts)} per 100g."
+
+
+@mcp.tool
+def list_products_without_nutrition() -> list[str]:
+    """Return product names that have no nutrition data set yet."""
+    products = api("get", "/objects/products") or []
+    missing = []
+    for p in products:
+        has_calories = p.get("calories") not in (None, 0, "")
+        userfields = api("get", f"/userfields/products/{p['id']}") or {}
+        has_macros = any(userfields.get(f) not in (None, "") for f in ("protein_g", "carbs_g", "fat_g"))
+        if not has_calories and not has_macros:
+            missing.append(p["name"])
+    return sorted(missing)
+
+
+@mcp.tool
+def lookup_nutrition(product_name: str) -> dict:
+    """Look up nutrition data from OpenFoodFacts by product name.
+    On exact match, returns values ready to pass to set_nutrition.
+    On no exact match, returns the closest result for confirmation — retry with a more specific name
+    or call set_nutrition directly with the returned values.
+
+    Args:
+        product_name: Product name to search for
+    """
+    import urllib.request
+    import urllib.parse
+
+    query = urllib.parse.quote(product_name)
+    url = (
+        f"https://world.openfoodfacts.org/cgi/search.pl"
+        f"?search_terms={query}&search_simple=1&action=process&json=1&page_size=5"
+        f"&fields=product_name,nutriments,brands"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "grocy-mcp/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+
+    products = data.get("products", [])
+    if not products:
+        return {"error": f"No results found for '{product_name}' on OpenFoodFacts."}
+
+    def _extract(p: dict) -> dict:
+        n = p.get("nutriments", {})
+        return {
+            "name": p.get("product_name", ""),
+            "brand": p.get("brands", ""),
+            "calories_kcal": n.get("energy-kcal_100g"),
+            "protein_g": n.get("proteins_100g"),
+            "carbs_g": n.get("carbohydrates_100g"),
+            "fat_g": n.get("fat_100g"),
+            "per": "100g",
+        }
+
+    # Exact match check
+    name_lower = product_name.lower()
+    for p in products:
+        if p.get("product_name", "").lower() == name_lower:
+            result = _extract(p)
+            result["match"] = "exact"
+            return result
+
+    # Return best (first) result for confirmation
+    result = _extract(products[0])
+    result["match"] = "closest"
+    result["message"] = (
+        f"No exact match for '{product_name}'. "
+        f"Closest: '{result['name']}' ({result['brand']}). "
+        "If correct, call set_nutrition with these values. Otherwise retry with a more specific name."
+    )
+    return result
+
+
+@mcp.tool
+def get_day_nutrition(date: str) -> dict:
+    """Calculate total nutrition for a given day based on the meal plan.
+
+    Args:
+        date: Date in YYYY-MM-DD format
+    """
+    entries = api("get", "/objects/meal_plan") or []
+    recipes_map = {r["id"]: r for r in (api("get", "/objects/recipes") or [])}
+    products_map = {p["id"]: p for p in (api("get", "/objects/products") or [])}
+
+    totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+    breakdown = []
+    no_data = []
+
+    day_entries = [e for e in entries if (e.get("day") or "")[:10] == date]
+    if not day_entries:
+        return {"date": date, "error": "No meal plan entries for this date."}
+
+    for entry in day_entries:
+        if not entry.get("recipe_id"):
+            continue
+        recipe = recipes_map.get(entry["recipe_id"])
+        if not recipe:
+            continue
+        servings = float(entry.get("recipe_servings") or recipe.get("desired_servings") or 1)
+        base_servings = float(recipe.get("base_servings") or recipe.get("desired_servings") or 1)
+        scale = servings / base_servings if base_servings else 1.0
+
+        positions = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe['id']}"}) or []
+        recipe_totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+
+        for pos in positions:
+            pid = pos.get("product_id")
+            amount_g = float(pos.get("amount", 0)) * scale
+            product = products_map.get(pid, {})
+            userfields = api("get", f"/userfields/products/{pid}") or {}
+
+            cal = product.get("calories")
+            prot = userfields.get("protein_g")
+            carb = userfields.get("carbs_g")
+            fat = userfields.get("fat_g")
+
+            if cal is None and prot is None:
+                no_data.append(product.get("name", f"product_{pid}"))
+                continue
+
+            factor = amount_g / 100.0
+            recipe_totals["calories_kcal"] += (float(cal or 0)) * factor
+            recipe_totals["protein_g"] += (float(prot or 0)) * factor
+            recipe_totals["carbs_g"] += (float(carb or 0)) * factor
+            recipe_totals["fat_g"] += (float(fat or 0)) * factor
+
+        for k in totals:
+            totals[k] += recipe_totals[k]
+        breakdown.append({"recipe": recipe["name"], **{k: round(v, 1) for k, v in recipe_totals.items()}})
+
+    result: dict = {
+        "date": date,
+        "total": {k: round(v, 1) for k, v in totals.items()},
+        "breakdown": breakdown,
+    }
+    if no_data:
+        result["missing_nutrition_data"] = list(set(no_data))
+    return result
 
 
 # ---------------------------------------------------------------------------
