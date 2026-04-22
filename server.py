@@ -1,6 +1,7 @@
 import difflib
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -17,7 +18,11 @@ mcp = FastMCP(
         "Always use product names — never IDs. "
         "Call get_system_info at the start of each session to learn available locations and quantity units — "
         "always use those exact names, never invent new ones unless explicitly creating them. "
-        "When a product name is ambiguous, call find_product to disambiguate before acting."
+        "When a product name is ambiguous, call find_product to disambiguate before acting. "
+        "When adding stock for packaged goods, amount must be in the product's stock unit: "
+        "e.g. 2 × 150g packages → amount=300 (grams). "
+        "If unsure about a product's unit, call get_product_details first. "
+        "If unsure about use-by date, call suggest_use_by."
     ),
 )
 
@@ -60,10 +65,161 @@ def _find_product(name: str) -> tuple[Optional[int], list[dict]]:
     return None, fuzzy
 
 
-def _get_or_create_product(name: str, location: Optional[str] = None) -> int:
+# ---------------------------------------------------------------------------
+# Unit / location inference helpers
+# ---------------------------------------------------------------------------
+
+# Maps canonical unit name (as it appears in Grocy) to aliases we recognise
+_UNIT_ALIASES: dict[str, list[str]] = {
+    "gram":      ["g", "gr", "grams", "gram"],
+    "kilogram":  ["kg", "kilogram", "kilograms"],
+    "liter":     ["l", "liter", "litre", "liters", "litres"],
+    "milliliter":["ml", "milliliter", "millilitre", "milliliters", "millilitres"],
+    "piece":     ["piece", "pieces", "pcs", "ks"],
+}
+
+# Keyword → canonical unit name (checked against product name, lower-case)
+_NAME_TO_UNIT: list[tuple[str, str]] = [
+    # weight-sold loose produce — set unit=kilogram
+    ("carrot", "kilogram"), ("potato", "kilogram"), ("onion", "kilogram"),
+    ("apple", "kilogram"), ("banana", "kilogram"), ("tomato", "kilogram"),
+    ("pepper", "kilogram"), ("lemon", "kilogram"), ("lime", "kilogram"),
+    ("garlic", "kilogram"), ("ginger", "kilogram"), ("zucchini", "kilogram"),
+    # liquid
+    ("milk", "liter"), ("juice", "liter"), ("oil", "liter"), ("vinegar", "liter"),
+    ("water", "liter"), ("broth", "liter"), ("stock", "liter"),
+    # piece-sold
+    ("egg", "piece"), ("lettuce", "piece"), ("cucumber", "piece"),
+    ("avocado", "piece"), ("bread", "piece"),
+]
+
+# Keyword → canonical location name fragment (matched against real location names)
+_NAME_TO_LOCATION: list[tuple[str, str]] = [
+    # Fridge
+    ("milk", "fridge"), ("cheese", "fridge"), ("yogurt", "fridge"),
+    ("cottage", "fridge"), ("butter", "fridge"), ("cream", "fridge"),
+    ("meat", "fridge"), ("chicken", "fridge"), ("beef", "fridge"),
+    ("pork", "fridge"), ("fish", "fridge"), ("salmon", "fridge"),
+    ("egg", "fridge"), ("salad", "fridge"), ("lettuce", "fridge"),
+    ("cucumber", "fridge"), ("pepper", "fridge"), ("carrot", "fridge"),
+    ("lemon", "fridge"), ("lime", "fridge"), ("tomato", "fridge"),
+    ("vegetable", "fridge"), ("fruit", "fridge"), ("avocado", "fridge"),
+    ("tofu", "fridge"), ("hummus", "fridge"),
+    # Freezer
+    ("frozen", "freezer"), ("ice cream", "freezer"), ("sorbet", "freezer"),
+    # Pantry (checked last — broad defaults)
+    ("pasta", "pantry"), ("rice", "pantry"), ("flour", "pantry"),
+    ("sugar", "pantry"), ("honey", "pantry"), ("jam", "pantry"),
+    ("sauce", "pantry"), ("canned", "pantry"), ("chickpea", "pantry"),
+    ("bean", "pantry"), ("lentil", "pantry"), ("coffee", "pantry"),
+    ("tea", "pantry"), ("soda", "pantry"), ("cereal", "pantry"),
+    ("oat", "pantry"), ("cracker", "pantry"), ("chip", "pantry"),
+    ("nut", "pantry"), ("chocolate", "pantry"), ("biscuit", "pantry"),
+    ("cookie", "pantry"), ("oil", "pantry"), ("vinegar", "pantry"),
+    ("stock", "pantry"), ("broth", "pantry"), ("water", "pantry"),
+    ("juice", "pantry"), ("wine", "pantry"), ("beer", "pantry"),
+]
+
+# Category → default best-before offset in days
+_USE_BY_DAYS: list[tuple[str, int]] = [
+    ("frozen", 180),
+    ("ice cream", 90),
+    ("meat", 3), ("chicken", 3), ("fish", 3), ("salmon", 3), ("beef", 3), ("pork", 3),
+    ("milk", 10), ("cream", 7), ("butter", 30),
+    ("yogurt", 14), ("cheese", 21), ("cottage", 7),
+    ("egg", 28),
+    ("lettuce", 5), ("salad", 5), ("spinach", 5),
+    ("herb", 7), ("avocado", 5),
+    ("tomato", 7), ("cucumber", 7), ("pepper", 10),
+    ("carrot", 21), ("onion", 30), ("potato", 30), ("garlic", 60),
+    ("lemon", 21), ("lime", 21), ("banana", 5), ("apple", 30),
+    ("bread", 5),
+    ("pasta", 730), ("rice", 730), ("flour", 365), ("sugar", 730),
+    ("oil", 365), ("vinegar", 730), ("honey", 730),
+    ("canned", 730), ("chickpea", 730), ("bean", 730), ("lentil", 730),
+    ("sauce", 730), ("jam", 365),
+    ("coffee", 365), ("tea", 730),
+    ("water", 730), ("juice", 365), ("soda", 365),
+    ("wine", 730), ("beer", 180),
+    ("chocolate", 365), ("biscuit", 180), ("cracker", 180), ("cereal", 365),
+]
+
+
+def _resolve_unit_id(canonical: str, units: list[dict]) -> Optional[int]:
+    """Return unit id for a canonical name like 'gram', 'kilogram', 'liter', 'piece'."""
+    canonical_lower = canonical.lower()
+    aliases = _UNIT_ALIASES.get(canonical_lower, [canonical_lower])
+    for u in units:
+        u_name = u["name"].lower()
+        u_plural = (u.get("name_plural") or "").lower()
+        if u_name in aliases or u_plural in aliases:
+            return u["id"]
+    return None
+
+
+def _infer_unit(product_name: str, units: list[dict]) -> tuple[Optional[int], Optional[str], Optional[float]]:
+    """
+    Infer (unit_id, unit_name, package_size_in_unit) from a product name.
+
+    Examples:
+      "Cottage Cheese Fit 150g"  → (gram_id, "gram",  150.0)
+      "UHT Milk 1.5% 1L"        → (liter_id, "liter", 1.0)
+      "Eggs"                     → (piece_id, "piece", None)
+      "Carrots"                  → (kg_id,    "kilogram", None)
+    """
+    name_lower = product_name.lower()
+
+    # Suffix patterns: e.g. "150g", "1.5L", "330ml", "1kg"
+    suffix_patterns = [
+        (r"(\d+(?:\.\d+)?)\s*kg\b",  "kilogram"),
+        (r"(\d+(?:\.\d+)?)\s*g\b",   "gram"),
+        (r"(\d+(?:\.\d+)?)\s*ml\b",  "milliliter"),
+        (r"(\d+(?:\.\d+)?)\s*l\b",   "liter"),
+    ]
+    for pattern, canonical in suffix_patterns:
+        m = re.search(pattern, name_lower)
+        if m:
+            uid = _resolve_unit_id(canonical, units)
+            if uid:
+                return uid, canonical, float(m.group(1))
+
+    # Keyword fallback
+    for keyword, canonical in _NAME_TO_UNIT:
+        if keyword in name_lower:
+            uid = _resolve_unit_id(canonical, units)
+            if uid:
+                return uid, canonical, None
+
+    return None, None, None
+
+
+def _infer_location_id(product_name: str, locations: list[dict]) -> Optional[int]:
+    """Infer a location id from product name keywords."""
+    name_lower = product_name.lower()
+    for keyword, fragment in _NAME_TO_LOCATION:
+        if keyword in name_lower:
+            # match fragment against actual location names
+            for loc in locations:
+                if fragment in loc["name"].lower():
+                    return loc["id"]
+    return None
+
+
+def _suggest_use_by(product_name: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (YYYY-MM-DD, reason) conservative use-by estimate. Does NOT persist."""
+    name_lower = product_name.lower()
+    for keyword, days in _USE_BY_DAYS:
+        if keyword in name_lower:
+            date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+            return date, f"{keyword} → +{days}d"
+    return None, None
+
+
+def _get_or_create_product(name: str, location: Optional[str] = None) -> tuple[int, Optional[str]]:
+    """Return (product_id, creation_note). creation_note is non-None when product was just created."""
     pid, matches = _find_product(name)
     if pid:
-        return pid
+        return pid, None
     if matches:
         raise ValueError(
             f"Ambiguous product '{name}'. Did you mean: {[m['name'] for m in matches[:5]]}?"
@@ -80,32 +236,52 @@ def _get_or_create_product(name: str, location: Optional[str] = None) -> int:
         )
 
     units = api("get", "/objects/quantity_units") or []
-    if not units:
-        r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
-        default_unit_id = r["created_object_id"]
-    else:
-        default_unit_id = units[0]["id"]
-
     locations = api("get", "/objects/locations") or []
-    if not locations:
-        r = api("post", "/objects/locations", json={"name": "Home"})
-        default_location_id = r["created_object_id"]
-    elif location:
+
+    # Resolve location
+    if location:
         loc_id = _location_id(location)
         if loc_id is None:
             valid = [l["name"] for l in locations]
             raise ValueError(f"Location '{location}' not found. Valid locations: {valid}")
-        default_location_id = loc_id
     else:
-        default_location_id = locations[0]["id"]
+        loc_id = _infer_location_id(name, locations)
+
+    if loc_id is None:
+        loc_id = next((l["id"] for l in locations if "pantry" in l["name"].lower()), None)
+    if loc_id is None and locations:
+        loc_id = locations[0]["id"]
+    if not loc_id:
+        r = api("post", "/objects/locations", json={"name": "Home"})
+        loc_id = r["created_object_id"]
+
+    # Resolve unit
+    inferred_unit_id, inferred_unit_name, package_size = _infer_unit(name, units)
+
+    if inferred_unit_id:
+        unit_id = inferred_unit_id
+        unit_note = inferred_unit_name
+    else:
+        # Fall back to "piece" explicitly, not random first
+        unit_id = _resolve_unit_id("piece", units)
+        if unit_id is None and units:
+            unit_id = units[0]["id"]
+        if unit_id is None:
+            r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
+            unit_id = r["created_object_id"]
+        unit_note = "piece (inferred)"
 
     result = api("post", "/objects/products", json={
         "name": name,
-        "qu_id_stock": default_unit_id,
-        "qu_id_purchase": default_unit_id,
-        "location_id": default_location_id,
+        "qu_id_stock": unit_id,
+        "qu_id_purchase": unit_id,
+        "qu_id_consume": unit_id,
+        "qu_id_price": unit_id,
+        "location_id": loc_id,
     })
-    return result["created_object_id"]
+    loc_name = next((l["name"] for l in locations if l["id"] == loc_id), str(loc_id))
+    note = f"[new product: unit={unit_note}, location={loc_name}]"
+    return result["created_object_id"], note
 
 
 def _unit_id(name: str) -> Optional[int]:
@@ -123,7 +299,6 @@ def _location_id(name: str) -> Optional[int]:
     for loc in locations:
         if loc["name"].lower() == name_lower:
             return loc["id"]
-    # fuzzy
     fuzzy = [loc for loc in locations if name_lower in loc["name"].lower()]
     if len(fuzzy) == 1:
         return fuzzy[0]["id"]
@@ -281,46 +456,73 @@ def find_product(name: str) -> dict:
 @mcp.tool
 def purchase(product_name: str, amount: float, use_by: Optional[str] = None, location: Optional[str] = None) -> str:
     """Add stock for a product. Creates the product automatically if it doesn't exist yet.
+    Amount must be in the product's stock unit (e.g. grams for 'Cottage Cheese Fit 150g').
+    For packaged goods: amount = package_size × package_count (e.g. 2 × 150g = 300).
 
     Args:
         product_name: Name of the product
-        amount: Quantity to add
-        use_by: Best-before date in YYYY-MM-DD format (optional, agent should estimate if known)
+        amount: Quantity to add, in the product's stock unit
+        use_by: Best-before date in YYYY-MM-DD format (optional; call suggest_use_by if unsure)
         location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry' (used when creating a new product)
     """
     try:
-        pid = _get_or_create_product(product_name, location=location)
+        pid, creation_note = _get_or_create_product(product_name, location=location)
     except ValueError as e:
         return str(e)
+
+    # Look up unit name for confirmation
+    products = api("get", "/objects/products") or []
+    p = next((x for x in products if x["id"] == pid), {})
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    unit_name = units.get(p.get("qu_id_stock"), "")
+
     payload: dict = {"amount": amount, "transaction_type": "purchase"}
     if use_by:
         payload["best_before_date"] = use_by
     api("post", f"/stock/products/{pid}/add", json=payload)
-    suffix = f" (use by {use_by})" if use_by else ""
-    return f"Added {amount} × '{product_name}' to stock{suffix}."
+
+    parts = [f"Added {amount} {unit_name} × '{product_name}'"]
+    if use_by:
+        parts.append(f"use by {use_by}")
+    if creation_note:
+        parts.append(creation_note)
+    return " — ".join(parts) + "."
 
 
 @mcp.tool
 def batch_purchase(items: list[dict]) -> str:
     """Add multiple products to stock in one call — ideal for logging a shopping trip.
+    For packaged goods specify amount as total quantity in stock units, not package count.
+    E.g. 2 × 150g packages → amount=300 (grams), not amount=2.
 
     Args:
         items: List of {product_name: str, amount: float, use_by: str (optional YYYY-MM-DD), location: str (optional)}
     """
     results = []
+    units_cache: dict = {}
+
     for item in items:
         name = item.get("product_name", "")
         amount = float(item.get("amount", 1))
         use_by = item.get("use_by")
         location = item.get("location")
         try:
-            pid = _get_or_create_product(name, location=location)
+            pid, creation_note = _get_or_create_product(name, location=location)
+
+            if not units_cache:
+                units_cache = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+            products = api("get", "/objects/products") or []
+            p = next((x for x in products if x["id"] == pid), {})
+            unit_name = units_cache.get(p.get("qu_id_stock"), "")
+
             payload: dict = {"amount": amount, "transaction_type": "purchase"}
             if use_by:
                 payload["best_before_date"] = use_by
             api("post", f"/stock/products/{pid}/add", json=payload)
+
             suffix = f" (use by {use_by})" if use_by else ""
-            results.append(f"✓ {amount} × {name}{suffix}")
+            note = f" {creation_note}" if creation_note else ""
+            results.append(f"✓ {amount} {unit_name} × {name}{suffix}{note}")
         except Exception as e:
             results.append(f"✗ {name}: {e}")
     return "\n".join(results)
@@ -364,36 +566,156 @@ def adjust_stock(product_name: str, new_amount: float) -> str:
 
 
 @mcp.tool
-def create_product(name: str, default_unit: str = "piece", location: Optional[str] = None) -> str:
+def create_product(name: str, default_unit: Optional[str] = None, location: Optional[str] = None) -> str:
     """Explicitly create a new product in the system.
+    Unit and location are inferred from the product name if not provided.
 
     Args:
         name: Product name
-        default_unit: Default quantity unit (e.g. 'gram', 'piece', 'liter', 'milliliter')
-        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry'
+        default_unit: Default quantity unit (e.g. 'gram', 'piece', 'liter'). Auto-inferred from name if omitted.
+        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry'. Auto-inferred from name if omitted.
     """
-    uid = _unit_id(default_unit)
-    if uid is None:
-        units = api("get", "/objects/quantity_units") or []
-        if not units:
-            return f"No quantity units found. Call get_system_info to see available units."
-        valid = [u["name"] for u in units]
-        return f"Unit '{default_unit}' not found. Available units: {valid}"
-
+    units = api("get", "/objects/quantity_units") or []
     locations = api("get", "/objects/locations") or []
+
+    # Resolve unit
+    if default_unit:
+        uid = _unit_id(default_unit)
+        if uid is None:
+            valid = [u["name"] for u in units]
+            return f"Unit '{default_unit}' not found. Available units: {valid}"
+        unit_name = default_unit
+    else:
+        uid, unit_name, _ = _infer_unit(name, units)
+        if uid is None:
+            uid = _resolve_unit_id("piece", units) or (units[0]["id"] if units else None)
+            unit_name = "piece (inferred)"
+
+    # Resolve location
     if location:
         loc_id = _location_id(location)
         if loc_id is None:
             valid = [l["name"] for l in locations]
             return f"Location '{location}' not found. Available locations: {valid}"
+        loc_name = location
     else:
-        loc_id = locations[0]["id"] if locations else None
+        loc_id = _infer_location_id(name, locations)
+        if loc_id is None:
+            loc_id = next((l["id"] for l in locations if "pantry" in l["name"].lower()), None)
+        if loc_id is None and locations:
+            loc_id = locations[0]["id"]
+        loc_name = next((l["name"] for l in locations if l["id"] == loc_id), "unknown") if loc_id else "none"
 
-    payload: dict = {"name": name, "qu_id_stock": uid, "qu_id_purchase": uid}
+    payload: dict = {
+        "name": name,
+        "qu_id_stock": uid,
+        "qu_id_purchase": uid,
+        "qu_id_consume": uid,
+        "qu_id_price": uid,
+    }
     if loc_id:
         payload["location_id"] = loc_id
     api("post", "/objects/products", json=payload)
-    return f"Created product '{name}' with unit '{default_unit}'."
+    return f"Created product '{name}' — unit: {unit_name}, location: {loc_name}."
+
+
+@mcp.tool
+def get_product_details(product_name: str) -> dict:
+    """Get full details of a product: unit, location, current stock, open amount, min stock.
+
+    Args:
+        product_name: Name of the product
+    """
+    pid, matches = _find_product(product_name)
+    if not pid:
+        if matches:
+            return {"error": f"Ambiguous: {[m['name'] for m in matches[:5]]}"}
+        return {"error": f"Product '{product_name}' not found."}
+
+    products = api("get", "/objects/products") or []
+    p = next((x for x in products if x["id"] == pid), {})
+
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    locations = {l["id"]: l["name"] for l in (api("get", "/objects/locations") or [])}
+
+    stock_entries = api("get", "/stock") or []
+    entry = next((s for s in stock_entries if s["product_id"] == pid), None)
+
+    return {
+        "name": p.get("name"),
+        "unit": units.get(p.get("qu_id_stock")),
+        "location": locations.get(p.get("location_id")),
+        "in_stock": float(entry["amount"]) if entry else 0.0,
+        "open_amount": float(entry.get("open_amount", 0)) if entry else 0.0,
+        "min_stock": float(p.get("min_stock_amount") or 0),
+        "best_before": (entry or {}).get("best_before_date"),
+    }
+
+
+@mcp.tool
+def suggest_use_by(product_name: str) -> dict:
+    """Suggest a conservative best-before date for a product based on its name.
+    Returns a suggestion only — does not update anything. Pass the date to purchase/set_nutrition as needed.
+
+    Args:
+        product_name: Name of the product
+    """
+    date, reason = _suggest_use_by(product_name)
+    if date:
+        return {"suggested_use_by": date, "reason": reason}
+    return {"suggested_use_by": None, "reason": "No matching category — provide use_by explicitly."}
+
+
+@mcp.tool
+def update_product_unit(product_name: str, new_unit: str, new_total_amount: float) -> str:
+    """Change the stock unit of an existing product.
+    You must specify the correct total amount in the new unit (e.g. if changing from 'piece' to 'gram'
+    and you have 2 × 150g packages, set new_total_amount=300).
+
+    Args:
+        product_name: Name of the product
+        new_unit: New unit name (e.g. 'gram', 'kilogram', 'liter')
+        new_total_amount: Correct total stock amount expressed in the new unit
+    """
+    pid, matches = _find_product(product_name)
+    if not pid:
+        if matches:
+            return f"Ambiguous: {[m['name'] for m in matches[:5]]}"
+        return f"Product '{product_name}' not found."
+
+    uid = _unit_id(new_unit)
+    if uid is None:
+        units = api("get", "/objects/quantity_units") or []
+        return f"Unit '{new_unit}' not found. Available: {[u['name'] for u in units]}"
+
+    products = api("get", "/objects/products") or []
+    product = next((x for x in products if x["id"] == pid), {})
+    old_uid = product.get("qu_id_stock")
+
+    if old_uid == uid:
+        return f"'{product_name}' already uses unit '{new_unit}'."
+
+    # Create temporary 1:1 conversion to satisfy Grocy's constraint
+    conv = api("post", "/objects/quantity_unit_conversions", json={
+        "from_qu_id": old_uid, "to_qu_id": uid, "factor": 1, "product_id": pid,
+    })
+    conv_id = conv["created_object_id"]
+
+    try:
+        # Zero out stock
+        api("post", f"/stock/products/{pid}/inventory", json={"new_amount": 0, "best_before_date": "2999-12-31"})
+
+        # Update unit on product
+        patch = {**product, "qu_id_stock": uid, "qu_id_purchase": uid, "qu_id_consume": uid, "qu_id_price": uid}
+        patch.pop("userfields", None)
+        api("put", f"/objects/products/{pid}", json=patch)
+
+        # Re-add with correct amount
+        api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount})
+    finally:
+        api("delete", f"/objects/quantity_unit_conversions/{conv_id}")
+
+    return f"'{product_name}' unit changed to '{new_unit}', stock set to {new_total_amount}."
 
 
 # ---------------------------------------------------------------------------
