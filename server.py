@@ -1,3 +1,4 @@
+import difflib
 import os
 from datetime import datetime, timedelta
 from typing import Optional
@@ -13,6 +14,8 @@ mcp = FastMCP(
     instructions=(
         "Manage food inventory, recipes and meal plans via Grocy. "
         "Always use product names — never IDs. "
+        "Call get_system_info at the start of each session to learn available locations and quantity units — "
+        "always use those exact names, never invent new ones unless explicitly creating them. "
         "When a product name is ambiguous, call find_product to disambiguate before acting."
     ),
 )
@@ -64,6 +67,17 @@ def _get_or_create_product(name: str, location: Optional[str] = None) -> int:
         raise ValueError(
             f"Ambiguous product '{name}'. Did you mean: {[m['name'] for m in matches[:5]]}?"
         )
+
+    # Similarity guard — catch near-duplicates before creating
+    all_products = api("get", "/objects/products") or []
+    existing_names = [p["name"] for p in all_products]
+    close = difflib.get_close_matches(name, existing_names, n=3, cutoff=0.75)
+    if close:
+        raise ValueError(
+            f"Product '{name}' not found, but similar products exist: {close}. "
+            "Use one of those names or confirm you want a new product by calling create_product explicitly."
+        )
+
     units = api("get", "/objects/quantity_units") or []
     if not units:
         r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
@@ -76,7 +90,11 @@ def _get_or_create_product(name: str, location: Optional[str] = None) -> int:
         r = api("post", "/objects/locations", json={"name": "Home"})
         default_location_id = r["created_object_id"]
     elif location:
-        default_location_id = _location_id(location) or locations[0]["id"]
+        loc_id = _location_id(location)
+        if loc_id is None:
+            valid = [l["name"] for l in locations]
+            raise ValueError(f"Location '{location}' not found. Valid locations: {valid}")
+        default_location_id = loc_id
     else:
         default_location_id = locations[0]["id"]
 
@@ -124,16 +142,88 @@ def _recipe_by_name(name: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Tools — System Info
+# ---------------------------------------------------------------------------
+
+@mcp.tool
+def get_system_info() -> dict:
+    """Return available locations, quantity units, and stock summary.
+    Call this at the start of a session before creating products or stock entries.
+    """
+    locations = api("get", "/objects/locations") or []
+    units = api("get", "/objects/quantity_units") or []
+    products = api("get", "/objects/products") or []
+    stock = api("get", "/stock") or []
+    return {
+        "locations": [l["name"] for l in locations],
+        "quantity_units": [u["name"] for u in units],
+        "total_products": len(products),
+        "products_in_stock": len(stock),
+    }
+
+
+@mcp.tool
+def create_location(name: str) -> str:
+    """Create a new storage location (e.g. 'Wine Cellar'). Only call if location doesn't already exist.
+
+    Args:
+        name: Location name
+    """
+    existing = api("get", "/objects/locations") or []
+    if any(l["name"].lower() == name.lower() for l in existing):
+        return f"Location '{name}' already exists."
+    api("post", "/objects/locations", json={"name": name})
+    return f"Created location '{name}'."
+
+
+@mcp.tool
+def create_quantity_unit(name: str, name_plural: Optional[str] = None) -> str:
+    """Create a new quantity unit (e.g. 'kg', 'tbsp'). Only call if unit doesn't already exist.
+
+    Args:
+        name: Unit name singular (e.g. 'kilogram')
+        name_plural: Unit name plural (e.g. 'kilograms'), defaults to name + 's'
+    """
+    existing = api("get", "/objects/quantity_units") or []
+    if any(u["name"].lower() == name.lower() for u in existing):
+        return f"Quantity unit '{name}' already exists."
+    api("post", "/objects/quantity_units", json={
+        "name": name,
+        "name_plural": name_plural or f"{name}s",
+    })
+    return f"Created quantity unit '{name}'."
+
+
+# ---------------------------------------------------------------------------
 # Tools — Inventory
 # ---------------------------------------------------------------------------
 
 @mcp.tool
-def get_stock() -> list[dict]:
-    """Return all items currently in stock with product name, amount, unit and best-before date."""
+def get_stock(location: Optional[str] = None, search: Optional[str] = None, expiring_first: bool = False) -> list[dict]:
+    """Return items currently in stock with product name, amount, unit and best-before date.
+
+    Args:
+        location: Filter by storage location name (e.g. 'Fridge', 'Freezer', 'Pantry')
+        search: Filter by product name substring
+        expiring_first: If true, sort by soonest best-before date first
+    """
     items = api("get", "/stock")
+
+    # Build location filter
+    loc_id = None
+    if location:
+        loc_id = _location_id(location)
+
     out = []
     for item in items:
-        product_name = (item.get("product") or {}).get("name") or f"product_{item['product_id']}"
+        product = item.get("product") or {}
+        product_name = product.get("name") or f"product_{item['product_id']}"
+
+        if search and search.lower() not in product_name.lower():
+            continue
+        if loc_id is not None and product.get("location_id") != loc_id:
+            continue
+
         unit_name = (item.get("quantity_unit_stock") or {}).get("name", "")
         bbd = item.get("best_before_date") or ""
         out.append({
@@ -141,8 +231,21 @@ def get_stock() -> list[dict]:
             "amount": float(item.get("stock_amount") or item.get("amount", 0)),
             "unit": unit_name,
             "best_before": None if bbd == "2999-12-31" else bbd or None,
+            "location": product.get("location_id"),
         })
-    return sorted(out, key=lambda x: x["product"])
+
+    if expiring_first:
+        out.sort(key=lambda x: x["best_before"] or "9999-99-99")
+    else:
+        out.sort(key=lambda x: x["product"])
+
+    # Resolve location IDs to names in output
+    if any(x["location"] for x in out):
+        locations = {l["id"]: l["name"] for l in (api("get", "/objects/locations") or [])}
+        for x in out:
+            x["location"] = locations.get(x["location"])
+
+    return out
 
 
 @mcp.tool
@@ -197,6 +300,32 @@ def purchase(product_name: str, amount: float, use_by: Optional[str] = None, loc
 
 
 @mcp.tool
+def batch_purchase(items: list[dict]) -> str:
+    """Add multiple products to stock in one call — ideal for logging a shopping trip.
+
+    Args:
+        items: List of {product_name: str, amount: float, use_by: str (optional YYYY-MM-DD), location: str (optional)}
+    """
+    results = []
+    for item in items:
+        name = item.get("product_name", "")
+        amount = float(item.get("amount", 1))
+        use_by = item.get("use_by")
+        location = item.get("location")
+        try:
+            pid = _get_or_create_product(name, location=location)
+            payload: dict = {"amount": amount, "transaction_type": "purchase"}
+            if use_by:
+                payload["best_before_date"] = use_by
+            api("post", f"/stock/products/{pid}/add", json=payload)
+            suffix = f" (use by {use_by})" if use_by else ""
+            results.append(f"✓ {amount} × {name}{suffix}")
+        except Exception as e:
+            results.append(f"✗ {name}: {e}")
+    return "\n".join(results)
+
+
+@mcp.tool
 def consume(product_name: str, amount: float) -> str:
     """Consume/use stock for a product.
 
@@ -244,12 +373,18 @@ def create_product(name: str, default_unit: str = "piece", location: Optional[st
     """
     uid = _unit_id(default_unit)
     if uid is None:
-        units = api("get", "/objects/quantity_units")
-        uid = units[0]["id"] if units else 1
+        units = api("get", "/objects/quantity_units") or []
+        if not units:
+            return f"No quantity units found. Call get_system_info to see available units."
+        valid = [u["name"] for u in units]
+        return f"Unit '{default_unit}' not found. Available units: {valid}"
 
     locations = api("get", "/objects/locations") or []
     if location:
-        loc_id = _location_id(location) or (locations[0]["id"] if locations else None)
+        loc_id = _location_id(location)
+        if loc_id is None:
+            valid = [l["name"] for l in locations]
+            return f"Location '{location}' not found. Available locations: {valid}"
     else:
         loc_id = locations[0]["id"] if locations else None
 
@@ -281,6 +416,44 @@ def get_recipes() -> list[dict]:
             "can_make_now": can_make,
         })
     return out
+
+
+@mcp.tool
+def suggest_recipes_from_expiring(days: int = 5) -> list[dict]:
+    """Suggest recipes that use products expiring soon.
+
+    Args:
+        days: Look ahead this many days for expiring products (default 5)
+    """
+    volatile = api("get", "/stock/volatile", params={"due_soon_days": days})
+    expiring = volatile.get("expiring_products", []) + volatile.get("expired_products", [])
+    if not expiring:
+        return []
+
+    expiring_ids = {item["product_id"] for item in expiring}
+    expiring_names = {
+        item["product_id"]: (item.get("product") or {}).get("name", f"product_{item['product_id']}")
+        for item in expiring
+    }
+
+    recipes = api("get", "/objects/recipes") or []
+    suggestions = []
+    for recipe in recipes:
+        positions = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe['id']}"}) or []
+        uses_expiring = [expiring_names[p["product_id"]] for p in positions if p.get("product_id") in expiring_ids]
+        if uses_expiring:
+            try:
+                f = api("get", f"/recipes/{recipe['id']}/fulfillment")
+                can_make = f.get("need_fulfilled", False)
+            except Exception:
+                can_make = None
+            suggestions.append({
+                "recipe": recipe["name"],
+                "uses_expiring": uses_expiring,
+                "can_make_now": can_make,
+            })
+
+    return sorted(suggestions, key=lambda x: -len(x["uses_expiring"]))
 
 
 @mcp.tool
@@ -445,6 +618,43 @@ def add_missing_to_shopping_list(recipe_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool
+def plan_week(entries: list[dict]) -> str:
+    """Schedule multiple recipes for the week in one call.
+
+    Args:
+        entries: List of {recipe_name: str, date: str (YYYY-MM-DD)}
+    """
+    results = []
+    missing_summary = []
+    for entry in entries:
+        recipe_name = entry.get("recipe_name", "")
+        date = entry.get("date", "")
+        recipe = _recipe_by_name(recipe_name)
+        if not recipe:
+            results.append(f"✗ {recipe_name}: recipe not found")
+            continue
+        api("post", "/objects/meal_plan", json={
+            "recipe_id": recipe["id"],
+            "day": date,
+            "recipe_servings": recipe.get("desired_servings", 1),
+            "type": "recipe",
+        })
+        line = f"✓ {date}: {recipe_name}"
+        try:
+            f = api("get", f"/recipes/{recipe['id']}/fulfillment")
+            if not f.get("need_fulfilled"):
+                missing = f.get("missing_products_count", "?")
+                line += f" ⚠️ ({missing} missing)"
+                missing_summary.append(recipe_name)
+        except Exception:
+            pass
+        results.append(line)
+
+    if missing_summary:
+        results.append(f"\nMissing ingredients for: {', '.join(missing_summary)}. Consider calling add_missing_to_shopping_list for each.")
+    return "\n".join(results)
+
+@mcp.tool
 def get_meal_plan(days_ahead: int = 7) -> list[dict]:
     """Get the meal plan from today for the next N days.
 
@@ -498,7 +708,15 @@ def add_to_meal_plan(recipe_name: str, date: str) -> str:
         "recipe_servings": recipe.get("desired_servings", 1),
         "type": "recipe",
     })
-    return f"Scheduled '{recipe_name}' for {date}."
+    msg = f"Scheduled '{recipe_name}' for {date}."
+    try:
+        f = api("get", f"/recipes/{recipe['id']}/fulfillment")
+        if not f.get("need_fulfilled"):
+            missing = f.get("missing_products_count", "?")
+            msg += f" ⚠️ Stock check: {missing} ingredient(s) missing — consider adding them to the shopping list."
+    except Exception:
+        pass
+    return msg
 
 
 @mcp.tool
