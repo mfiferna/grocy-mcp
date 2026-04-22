@@ -66,15 +66,23 @@ def _get_or_create_product(name: str) -> int:
         )
     units = api("get", "/objects/quantity_units") or []
     if not units:
-        # Fresh Grocy with no units — create a generic one
         r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
         default_unit_id = r["created_object_id"]
     else:
         default_unit_id = units[0]["id"]
+
+    locations = api("get", "/objects/locations") or []
+    if not locations:
+        r = api("post", "/objects/locations", json={"name": "Home"})
+        default_location_id = r["created_object_id"]
+    else:
+        default_location_id = locations[0]["id"]
+
     result = api("post", "/objects/products", json={
         "name": name,
         "qu_id_stock": default_unit_id,
         "qu_id_purchase": default_unit_id,
+        "location_id": default_location_id,
     })
     return result["created_object_id"]
 
