@@ -1,0 +1,23 @@
+services:
+  grocy-mcp:
+    image: ghcr.io/mfiferna/grocy-mcp:latest
+    container_name: grocy-mcp
+    environment:
+      - GROCY_BASE_URL=https://grocy.fifer.dev
+      - GROCY_API_KEY=your_api_key_here
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+
+      # Router
+      - "traefik.http.routers.grocy-mcp.rule=Host(`mcp-grocy.fifer.dev`)"
+      - "traefik.http.routers.grocy-mcp.entrypoints=web"
+
+      # Service
+      - "traefik.http.services.grocy-mcp.loadbalancer.server.port=8080"
+
+networks:
+  proxy:
+    external: true
