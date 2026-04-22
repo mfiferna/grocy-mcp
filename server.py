@@ -27,7 +27,13 @@ def api(method: str, path: str, **kwargs):
     headers = {"GROCY-API-KEY": GROCY_API_KEY, "Accept": "application/json"}
     with httpx.Client(headers=headers, timeout=30) as client:
         resp = getattr(client, method)(url, **kwargs)
-        resp.raise_for_status()
+        if resp.is_error:
+            body = resp.text[:500] if resp.content else "(empty body)"
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} {resp.reason_phrase} for {path}: {body}",
+                request=resp.request,
+                response=resp,
+            )
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
@@ -58,8 +64,13 @@ def _get_or_create_product(name: str) -> int:
         raise ValueError(
             f"Ambiguous product '{name}'. Did you mean: {[m['name'] for m in matches[:5]]}?"
         )
-    units = api("get", "/objects/quantity_units")
-    default_unit_id = units[0]["id"] if units else 1
+    units = api("get", "/objects/quantity_units") or []
+    if not units:
+        # Fresh Grocy with no units — create a generic one
+        r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
+        default_unit_id = r["created_object_id"]
+    else:
+        default_unit_id = units[0]["id"]
     result = api("post", "/objects/products", json={
         "name": name,
         "qu_id_stock": default_unit_id,
