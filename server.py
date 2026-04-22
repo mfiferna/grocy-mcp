@@ -56,7 +56,7 @@ def _find_product(name: str) -> tuple[Optional[int], list[dict]]:
     return None, fuzzy
 
 
-def _get_or_create_product(name: str) -> int:
+def _get_or_create_product(name: str, location: Optional[str] = None) -> int:
     pid, matches = _find_product(name)
     if pid:
         return pid
@@ -75,6 +75,8 @@ def _get_or_create_product(name: str) -> int:
     if not locations:
         r = api("post", "/objects/locations", json={"name": "Home"})
         default_location_id = r["created_object_id"]
+    elif location:
+        default_location_id = _location_id(location) or locations[0]["id"]
     else:
         default_location_id = locations[0]["id"]
 
@@ -93,6 +95,19 @@ def _unit_id(name: str) -> Optional[int]:
     for u in units:
         if u["name"].lower() == name_lower or (u.get("name_plural") or "").lower() == name_lower:
             return u["id"]
+    return None
+
+
+def _location_id(name: str) -> Optional[int]:
+    locations = api("get", "/objects/locations") or []
+    name_lower = name.lower()
+    for loc in locations:
+        if loc["name"].lower() == name_lower:
+            return loc["id"]
+    # fuzzy
+    fuzzy = [loc for loc in locations if name_lower in loc["name"].lower()]
+    if len(fuzzy) == 1:
+        return fuzzy[0]["id"]
     return None
 
 
@@ -160,16 +175,17 @@ def find_product(name: str) -> dict:
 
 
 @mcp.tool
-def purchase(product_name: str, amount: float, use_by: Optional[str] = None) -> str:
+def purchase(product_name: str, amount: float, use_by: Optional[str] = None, location: Optional[str] = None) -> str:
     """Add stock for a product. Creates the product automatically if it doesn't exist yet.
 
     Args:
         product_name: Name of the product
         amount: Quantity to add
         use_by: Best-before date in YYYY-MM-DD format (optional, agent should estimate if known)
+        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry' (used when creating a new product)
     """
     try:
-        pid = _get_or_create_product(product_name)
+        pid = _get_or_create_product(product_name, location=location)
     except ValueError as e:
         return str(e)
     payload: dict = {"amount": amount, "transaction_type": "purchase"}
@@ -218,22 +234,29 @@ def adjust_stock(product_name: str, new_amount: float) -> str:
 
 
 @mcp.tool
-def create_product(name: str, default_unit: str = "piece") -> str:
+def create_product(name: str, default_unit: str = "piece", location: Optional[str] = None) -> str:
     """Explicitly create a new product in the system.
 
     Args:
         name: Product name
         default_unit: Default quantity unit (e.g. 'gram', 'piece', 'liter', 'milliliter')
+        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry'
     """
     uid = _unit_id(default_unit)
     if uid is None:
         units = api("get", "/objects/quantity_units")
         uid = units[0]["id"] if units else 1
-    api("post", "/objects/products", json={
-        "name": name,
-        "qu_id_stock": uid,
-        "qu_id_purchase": uid,
-    })
+
+    locations = api("get", "/objects/locations") or []
+    if location:
+        loc_id = _location_id(location) or (locations[0]["id"] if locations else None)
+    else:
+        loc_id = locations[0]["id"] if locations else None
+
+    payload: dict = {"name": name, "qu_id_stock": uid, "qu_id_purchase": uid}
+    if loc_id:
+        payload["location_id"] = loc_id
+    api("post", "/objects/products", json=payload)
     return f"Created product '{name}' with unit '{default_unit}'."
 
 
