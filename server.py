@@ -903,9 +903,16 @@ def create_recipe(
     Args:
         name: Recipe name
         servings: Number of servings
-        ingredients: List of {product_name: str, amount: float, unit: str (optional)}
+        ingredients: List of {product_name: str, amount: float, unit: str}
         description: Recipe description or cooking instructions (optional)
     """
+    missing_units = [ing.get("product_name") for ing in ingredients if not ing.get("unit")]
+    if missing_units:
+        raise ValueError(
+            f"unit is required for every ingredient. Missing for: {missing_units}. "
+            "Use the product's stock unit (e.g. 'gram', 'piece', 'ml')."
+        )
+
     result = api("post", "/objects/recipes", json={
         "name": name,
         "description": description,
@@ -916,17 +923,17 @@ def create_recipe(
     errors = []
     for ing in ingredients:
         try:
-            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing.get("unit"))
+            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing["unit"])
+            uid = _unit_id(ing["unit"])
+            if not uid:
+                raise ValueError(f"unknown unit '{ing['unit']}'")
             pos: dict = {
                 "recipe_id": recipe_id,
                 "product_id": pid,
                 "amount": ing["amount"],
+                "qu_id": uid,
                 "only_check_single_unit_in_stock": 0,
             }
-            if ing.get("unit"):
-                uid = _unit_id(ing["unit"])
-                if uid:
-                    pos["qu_id"] = uid
             api("post", "/objects/recipes_pos", json=pos)
         except Exception as e:
             errors.append(f"{ing.get('product_name')}: {e}")
@@ -966,21 +973,27 @@ def update_recipe(
     api("put", f"/objects/recipes/{rid}", json=patch)
 
     if ingredients is not None:
+        missing_units = [ing.get("product_name") for ing in ingredients if not ing.get("unit")]
+        if missing_units:
+            raise ValueError(
+                f"unit is required for every ingredient. Missing for: {missing_units}. "
+                "Use the product's stock unit (e.g. 'gram', 'piece', 'ml')."
+            )
         existing = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={rid}"})
         for pos in existing:
             api("delete", f"/objects/recipes_pos/{pos['id']}")
         for ing in ingredients:
-            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing.get("unit"))
+            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing["unit"])
+            uid = _unit_id(ing["unit"])
+            if not uid:
+                raise ValueError(f"unknown unit '{ing['unit']}' for {ing['product_name']}")
             pos: dict = {
                 "recipe_id": rid,
                 "product_id": pid,
                 "amount": ing["amount"],
+                "qu_id": uid,
                 "only_check_single_unit_in_stock": 0,
             }
-            if ing.get("unit"):
-                uid = _unit_id(ing["unit"])
-                if uid:
-                    pos["qu_id"] = uid
             api("post", "/objects/recipes_pos", json=pos)
 
     return f"Updated recipe '{name}'."
