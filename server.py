@@ -1260,7 +1260,9 @@ def set_nutrition(
     product = next((p for p in products if p["id"] == pid), {})
 
     if calories_kcal is not None:
-        patch = {**product, "calories": calories_kcal}
+        # Strip keys Grocy rejects on PUT (e.g. embedded userfields dict)
+        patch = {k: v for k, v in product.items() if k != "userfields"}
+        patch["calories"] = calories_kcal
         api("put", f"/objects/products/{pid}", json=patch)
 
     userfields: dict = {}
