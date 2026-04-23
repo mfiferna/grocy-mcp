@@ -429,22 +429,39 @@ def get_stock(location: Optional[str] = None, search: Optional[str] = None, expi
 @mcp.tool
 def get_expiring_soon(days: int = 7) -> dict:
     """Return products expiring within `days` days (default 7), and already-expired products."""
-    volatile = api("get", "/stock/volatile", params={"due_soon_days": days})
+    # Grocy's /stock/volatile honours its own system setting for due_soon_days and may
+    # ignore the query param. Compute expiry from raw stock instead so `days` is always
+    # respected.
+    stock = api("get", "/stock") or []
+    today = datetime.now().date()
+    cutoff = today + timedelta(days=days)
 
-    def fmt(items):
-        return [
-            {
-                "product": (item.get("product") or {}).get("name") or f"product_{item.get('product_id')}",
-                "amount": float(item.get("stock_amount") or item.get("amount", 0)),
-                "best_before": item.get("best_before_date"),
-            }
-            for item in items
-        ]
+    expiring_soon = []
+    expired = []
 
-    return {
-        "expiring_soon": fmt(volatile.get("expiring_products", [])),
-        "expired": fmt(volatile.get("expired_products", [])),
-    }
+    for item in stock:
+        product = item.get("product") or {}
+        name = product.get("name") or f"product_{item.get('product_id')}"
+        amount = float(item.get("stock_amount") or item.get("amount", 0))
+        bbd_str = item.get("best_before_date") or ""
+
+        if not bbd_str or bbd_str == "2999-12-31":
+            continue
+        try:
+            bbd = datetime.strptime(bbd_str[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        entry = {"product": name, "amount": amount, "best_before": bbd_str[:10]}
+        if bbd < today:
+            expired.append(entry)
+        elif bbd <= cutoff:
+            expiring_soon.append(entry)
+
+    expiring_soon.sort(key=lambda x: x["best_before"])
+    expired.sort(key=lambda x: x["best_before"])
+
+    return {"expiring_soon": expiring_soon, "expired": expired}
 
 
 @mcp.tool
@@ -1412,4 +1429,4 @@ def get_day_nutrition(date: str) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8080)
+    mcp.run(transport="http", host="0.0.0.0", port=8080, stateless_http=True)
