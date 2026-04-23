@@ -454,15 +454,18 @@ def find_product(name: str) -> dict:
 
 
 @mcp.tool
-def purchase(product_name: str, amount: float, use_by: Optional[str] = None, location: Optional[str] = None) -> str:
+def purchase(product_name: str, amount: float, use_by: str, location: Optional[str] = None) -> str:
     """Add stock for a product. Creates the product automatically if it doesn't exist yet.
     Amount must be in the product's stock unit (e.g. grams for 'Cottage Cheese Fit 150g').
     For packaged goods: amount = package_size × package_count (e.g. 2 × 150g = 300).
 
+    use_by is REQUIRED. Use 'never' for items with no meaningful expiry (pantry staples,
+    spices, canned goods). Use YYYY-MM-DD for perishables. Call suggest_use_by if unsure.
+
     Args:
         product_name: Name of the product
         amount: Quantity to add, in the product's stock unit
-        use_by: Best-before date in YYYY-MM-DD format (optional; call suggest_use_by if unsure)
+        use_by: Best-before date as YYYY-MM-DD, or 'never' for no expiry
         location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry' (used when creating a new product)
     """
     try:
@@ -476,13 +479,12 @@ def purchase(product_name: str, amount: float, use_by: Optional[str] = None, loc
     units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
     unit_name = units.get(p.get("qu_id_stock"), "")
 
-    payload: dict = {"amount": amount, "transaction_type": "purchase"}
-    payload["best_before_date"] = use_by if use_by else "2999-12-31"
+    bbd = "2999-12-31" if use_by.lower() == "never" else use_by
+    payload: dict = {"amount": amount, "transaction_type": "purchase", "best_before_date": bbd}
     api("post", f"/stock/products/{pid}/add", json=payload)
 
-    parts = [f"Added {amount} {unit_name} × '{product_name}'"]
-    if use_by:
-        parts.append(f"use by {use_by}")
+    expiry_label = "no expiry" if use_by.lower() == "never" else f"use by {use_by}"
+    parts = [f"Added {amount} {unit_name} × '{product_name}'", expiry_label]
     if creation_note:
         parts.append(creation_note)
     return " — ".join(parts) + "."
@@ -494,8 +496,11 @@ def batch_purchase(items: list[dict]) -> str:
     For packaged goods specify amount as total quantity in stock units, not package count.
     E.g. 2 × 150g packages → amount=300 (grams), not amount=2.
 
+    use_by is REQUIRED for every item. Use 'never' for items with no meaningful expiry
+    (pantry staples, spices, canned goods). Use YYYY-MM-DD for perishables.
+
     Args:
-        items: List of {product_name: str, amount: float, use_by: str (optional YYYY-MM-DD), location: str (optional)}
+        items: List of {product_name: str, amount: float, use_by: str (YYYY-MM-DD or 'never'), location: str (optional)}
     """
     results = []
     units_cache: dict = {}
@@ -505,6 +510,11 @@ def batch_purchase(items: list[dict]) -> str:
         amount = float(item.get("amount", 1))
         use_by = item.get("use_by")
         location = item.get("location")
+
+        if not use_by:
+            results.append(f"✗ {name}: use_by is required — provide a YYYY-MM-DD date or 'never'")
+            continue
+
         try:
             pid, creation_note = _get_or_create_product(name, location=location)
 
@@ -514,13 +524,13 @@ def batch_purchase(items: list[dict]) -> str:
             p = next((x for x in products if x["id"] == pid), {})
             unit_name = units_cache.get(p.get("qu_id_stock"), "")
 
-            payload: dict = {"amount": amount, "transaction_type": "purchase"}
-            payload["best_before_date"] = use_by if use_by else "2999-12-31"
+            bbd = "2999-12-31" if use_by.lower() == "never" else use_by
+            payload: dict = {"amount": amount, "transaction_type": "purchase", "best_before_date": bbd}
             api("post", f"/stock/products/{pid}/add", json=payload)
 
-            suffix = f" (use by {use_by})" if use_by else ""
+            expiry_label = "no expiry" if use_by.lower() == "never" else f"use by {use_by}"
             note = f" {creation_note}" if creation_note else ""
-            results.append(f"✓ {amount} {unit_name} × {name}{suffix}{note}")
+            results.append(f"✓ {amount} {unit_name} × {name} ({expiry_label}){note}")
         except Exception as e:
             results.append(f"✗ {name}: {e}")
     return "\n".join(results)
@@ -544,23 +554,30 @@ def consume(product_name: str, amount: float) -> str:
 
 
 @mcp.tool
-def adjust_stock(product_name: str, new_amount: float) -> str:
+def adjust_stock(product_name: str, new_amount: float, use_by: str) -> str:
     """Set the absolute quantity of a product (manual inventory correction).
+
+    use_by is REQUIRED. Use 'never' for items with no meaningful expiry.
+    Use YYYY-MM-DD for perishables. Call suggest_use_by if unsure.
 
     Args:
         product_name: Name of the product
         new_amount: The correct absolute quantity
+        use_by: Best-before date as YYYY-MM-DD, or 'never' for no expiry
     """
     pid, matches = _find_product(product_name)
     if not pid:
         if matches:
             return f"Ambiguous: did you mean one of {[m['name'] for m in matches[:5]]}?"
         return f"Product '{product_name}' not found."
+    bbd = "2999-12-31" if use_by.lower() == "never" else use_by
     api("post", f"/stock/products/{pid}/inventory", json={
         "new_amount": new_amount,
+        "best_before_date": bbd,
         "transaction_type": "inventory-correction",
     })
-    return f"'{product_name}' stock set to {new_amount}."
+    expiry_label = "no expiry" if use_by.lower() == "never" else f"use by {use_by}"
+    return f"'{product_name}' stock set to {new_amount} ({expiry_label})."
 
 
 @mcp.tool
@@ -727,7 +744,7 @@ def update_product_unit(product_name: str, new_unit: str, new_total_amount: floa
                     "best_before_date": bbd,
                 })
         else:
-            api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount})
+            api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount, "best_before_date": "2999-12-31"})
     finally:
         api("delete", f"/objects/quantity_unit_conversions/{conv_id}")
 
@@ -854,7 +871,7 @@ def create_recipe(
     errors = []
     for ing in ingredients:
         try:
-            pid = _get_or_create_product(ing["product_name"])
+            pid, _ = _get_or_create_product(ing["product_name"])
             pos: dict = {
                 "recipe_id": recipe_id,
                 "product_id": pid,
@@ -908,7 +925,7 @@ def update_recipe(
         for pos in existing:
             api("delete", f"/objects/recipes_pos/{pos['id']}")
         for ing in ingredients:
-            pid = _get_or_create_product(ing["product_name"])
+            pid, _ = _get_or_create_product(ing["product_name"])
             pos: dict = {
                 "recipe_id": rid,
                 "product_id": pid,
@@ -1112,7 +1129,7 @@ def add_to_shopping_list(product_name: str, amount: float = 1, note: str = "") -
         note: Optional note (e.g. brand preference)
     """
     try:
-        pid = _get_or_create_product(product_name)
+        pid, _ = _get_or_create_product(product_name)
     except ValueError as e:
         return str(e)
     api("post", "/objects/shopping_list", json={"product_id": pid, "amount": amount, "note": note})
