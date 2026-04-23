@@ -907,7 +907,7 @@ def create_recipe(
         name: Recipe name
         servings: Number of servings
         ingredients: List of {product_name: str, amount: float, unit: str}
-        description: Recipe description or cooking instructions (optional)
+        description: Recipe description or cooking instructions as HTML (e.g. <p>Step 1...</p><p>Step 2...</p>)
     """
     missing_units = [ing.get("product_name") for ing in ingredients if not ing.get("unit")]
     if missing_units:
@@ -960,7 +960,7 @@ def update_recipe(
         name: Exact recipe name
         servings: New serving count (optional)
         ingredients: Replacement ingredient list — replaces all existing (optional)
-        description: New description (optional)
+        description: New description as HTML (e.g. <p>Step 1...</p><p>Step 2...</p>) — optional
     """
     recipe = _recipe_by_name(name)
     if not recipe:
