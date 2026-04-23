@@ -1214,9 +1214,23 @@ def remove_from_shopping_list(product_name: str) -> str:
     return f"Removed '{product_name}' from shopping list."
 
 
+
 # ---------------------------------------------------------------------------
 # Tools — Nutrition
 # ---------------------------------------------------------------------------
+
+_WEIGHT_VOLUME_UNITS = {"gram", "g", "kilogram", "kg", "ml", "milliliter", "millilitre", "liter", "litre", "l"}
+
+
+def _product_unit_name(product: dict) -> str:
+    """Return the lowercase stock unit name for a product object."""
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    return (units.get(product.get("qu_id_stock")) or "").lower()
+
+
+def _is_weight_or_volume(unit_name: str) -> bool:
+    return unit_name in _WEIGHT_VOLUME_UNITS
+
 
 @mcp.tool
 def get_nutrition(product_name: str) -> dict:
@@ -1233,40 +1247,58 @@ def get_nutrition(product_name: str) -> dict:
 
     products = api("get", "/objects/products") or []
     product = next((p for p in products if p["id"] == pid), {})
+    unit_name = _product_unit_name(product)
+    weight_vol = _is_weight_or_volume(unit_name)
 
     userfields = api("get", f"/userfields/products/{pid}") or {}
 
     cal_raw = product.get("calories")
-    # Grocy stores kcal/gram internally; multiply back to per-100g for display
-    cal_per_100g = round(float(cal_raw) * 100, 2) if cal_raw not in (None, "", 0) else None
+    if cal_raw not in (None, "", 0):
+        if weight_vol:
+            # Stored as kcal/gram; multiply back to per-100g for display
+            cal_display = round(float(cal_raw) * 100, 2)
+        else:
+            # Stored as kcal/piece (or other discrete unit)
+            cal_display = float(cal_raw)
+    else:
+        cal_display = None
 
+    per = "100g" if weight_vol else f"piece"
     return {
         "product": product.get("name", product_name),
-        "calories_kcal": cal_per_100g,
+        "calories_kcal": cal_display,
         "protein_g": userfields.get("protein_g"),
         "carbs_g": userfields.get("carbs_g"),
         "fat_g": userfields.get("fat_g"),
-        "per": "100g",
+        "per": per,
     }
 
 
 @mcp.tool
 def set_nutrition(
     product_name: str,
+    nutrition_unit: str,
     calories_kcal: Optional[float] = None,
     protein_g: Optional[float] = None,
     carbs_g: Optional[float] = None,
     fat_g: Optional[float] = None,
 ) -> str:
-    """Set nutrition values (per 100g) for a product.
+    """Set nutrition values for a product.
 
     Args:
         product_name: Name of the product
-        calories_kcal: Calories in kcal per 100g
-        protein_g: Protein in grams per 100g
-        carbs_g: Carbohydrates in grams per 100g
-        fat_g: Fat in grams per 100g
+        nutrition_unit: The unit these values are expressed per — must be '100g', '100ml',
+            or 'piece'. Must match the product's stock unit. Use get_product_details first
+            if unsure.
+        calories_kcal: Calories in kcal per nutrition_unit
+        protein_g: Protein in grams per nutrition_unit
+        carbs_g: Carbohydrates in grams per nutrition_unit
+        fat_g: Fat in grams per nutrition_unit
     """
+    VALID_UNITS = ("100g", "100ml", "piece")
+    if nutrition_unit not in VALID_UNITS:
+        raise ValueError(f"nutrition_unit must be one of {VALID_UNITS}, got '{nutrition_unit}'.")
+
     pid, matches = _find_product(product_name)
     if not pid:
         if matches:
@@ -1275,12 +1307,30 @@ def set_nutrition(
 
     products = api("get", "/objects/products") or []
     product = next((p for p in products if p["id"] == pid), {})
+    unit_name = _product_unit_name(product)
+    weight_vol = _is_weight_or_volume(unit_name)
+
+    # Validate the declared unit makes sense for this product's stock unit
+    if nutrition_unit in ("100g", "100ml") and not weight_vol:
+        raise ValueError(
+            f"Product '{product_name}' has stock unit '{unit_name}' (not weight/volume). "
+            f"Use nutrition_unit='piece' instead."
+        )
+    if nutrition_unit == "piece" and weight_vol:
+        raise ValueError(
+            f"Product '{product_name}' has stock unit '{unit_name}' (weight/volume). "
+            f"Use nutrition_unit='100g' or '100ml' instead."
+        )
 
     if calories_kcal is not None:
-        # Grocy's "calories" field is kcal per stock unit (i.e. kcal/gram for gram-based
-        # products). Divide by 100 so Grocy's UI shows correct totals; our API stays per 100g.
         patch = {k: v for k, v in product.items() if k != "userfields"}
-        patch["calories"] = calories_kcal / 100.0
+        if weight_vol:
+            # Grocy's "calories" field is kcal per stock unit (kcal/gram).
+            # We receive per-100g/100ml so divide by 100.
+            patch["calories"] = calories_kcal / 100.0
+        else:
+            # Piece-based: store kcal/piece directly
+            patch["calories"] = calories_kcal
         api("put", f"/objects/products/{pid}", json=patch)
 
     userfields: dict = {}
@@ -1302,7 +1352,7 @@ def set_nutrition(
         parts.append(f"{carbs_g}g carbs")
     if fat_g is not None:
         parts.append(f"{fat_g}g fat")
-    return f"Set nutrition for '{product_name}': {', '.join(parts)} per 100g."
+    return f"Set nutrition for '{product_name}': {', '.join(parts)} per {nutrition_unit}."
 
 
 @mcp.tool
@@ -1411,8 +1461,10 @@ def get_day_nutrition(date: str) -> dict:
 
         for pos in positions:
             pid = pos.get("product_id")
-            amount_g = float(pos.get("amount", 0)) * scale
+            amount = float(pos.get("amount", 0)) * scale
             product = products_map.get(pid, {})
+            unit_name = _product_unit_name(product)
+            is_wv = _is_weight_or_volume(unit_name)
             userfields = api("get", f"/userfields/products/{pid}") or {}
 
             cal = product.get("calories")
@@ -1424,11 +1476,16 @@ def get_day_nutrition(date: str) -> dict:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
 
-            # calories stored as kcal/gram in Grocy; macros userfields are per 100g
-            macro_factor = amount_g / 100.0
-            recipe_totals["calories_kcal"] += float(cal or 0) * amount_g
-            recipe_totals["protein_g"] += (float(prot or 0)) * macro_factor
-            recipe_totals["carbs_g"] += (float(carb or 0)) * macro_factor
+            if is_wv:
+                # calories stored as kcal/gram; macros per 100g
+                recipe_totals["calories_kcal"] += float(cal or 0) * amount
+                macro_factor = amount / 100.0
+            else:
+                # calories stored as kcal/piece; macros per piece
+                recipe_totals["calories_kcal"] += float(cal or 0) * amount
+                macro_factor = amount
+            recipe_totals["protein_g"] += float(prot or 0) * macro_factor
+            recipe_totals["carbs_g"] += float(carb or 0) * macro_factor
             recipe_totals["fat_g"] += (float(fat or 0)) * macro_factor
 
         for k in totals:
