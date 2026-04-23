@@ -744,7 +744,10 @@ def update_product_unit(product_name: str, new_unit: str, new_total_amount: floa
                     "best_before_date": bbd,
                 })
         else:
-            api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount, "best_before_date": "2999-12-31"})
+            raise ValueError(
+                f"No stock entries found for '{product_name}' — cannot determine use_by date. "
+                "Use purchase() to add stock with an explicit use_by instead."
+            )
     finally:
         api("delete", f"/objects/quantity_unit_conversions/{conv_id}")
 
