@@ -581,10 +581,20 @@ def adjust_stock(product_name: str, new_amount: float, use_by: str) -> str:
             return f"Ambiguous: did you mean one of {[m['name'] for m in matches[:5]]}?"
         return f"Product '{product_name}' not found."
     bbd = "2999-12-31" if use_by.lower() == "never" else use_by
-    api("post", f"/stock/products/{pid}/inventory", json={
-        "new_amount": new_amount,
+
+    # Grocy's inventory endpoint rejects the call when new_amount == current amount,
+    # so we always consume all current stock and re-add with the correct date.
+    stock = api("get", "/stock") or []
+    current = next((float(s.get("stock_amount", 0)) for s in stock if s.get("product_id") == pid), 0.0)
+    if current > 0:
+        api("post", f"/stock/products/{pid}/consume", json={
+            "amount": current,
+            "transaction_type": "consume",
+        })
+    api("post", f"/stock/products/{pid}/add", json={
+        "amount": new_amount,
+        "transaction_type": "purchase",
         "best_before_date": bbd,
-        "transaction_type": "inventory-correction",
     })
     expiry_label = "no expiry" if use_by.lower() == "never" else f"use by {use_by}"
     return f"'{product_name}' stock set to {new_amount} ({expiry_label})."
