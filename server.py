@@ -1236,9 +1236,13 @@ def get_nutrition(product_name: str) -> dict:
 
     userfields = api("get", f"/userfields/products/{pid}") or {}
 
+    cal_raw = product.get("calories")
+    # Grocy stores kcal/gram internally; multiply back to per-100g for display
+    cal_per_100g = round(float(cal_raw) * 100, 2) if cal_raw not in (None, "", 0) else None
+
     return {
         "product": product.get("name", product_name),
-        "calories_kcal": product.get("calories"),
+        "calories_kcal": cal_per_100g,
         "protein_g": userfields.get("protein_g"),
         "carbs_g": userfields.get("carbs_g"),
         "fat_g": userfields.get("fat_g"),
@@ -1273,9 +1277,10 @@ def set_nutrition(
     product = next((p for p in products if p["id"] == pid), {})
 
     if calories_kcal is not None:
-        # Strip keys Grocy rejects on PUT (e.g. embedded userfields dict)
+        # Grocy's "calories" field is kcal per stock unit (i.e. kcal/gram for gram-based
+        # products). Divide by 100 so Grocy's UI shows correct totals; our API stays per 100g.
         patch = {k: v for k, v in product.items() if k != "userfields"}
-        patch["calories"] = calories_kcal
+        patch["calories"] = calories_kcal / 100.0
         api("put", f"/objects/products/{pid}", json=patch)
 
     userfields: dict = {}
@@ -1419,11 +1424,12 @@ def get_day_nutrition(date: str) -> dict:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
 
-            factor = amount_g / 100.0
-            recipe_totals["calories_kcal"] += (float(cal or 0)) * factor
-            recipe_totals["protein_g"] += (float(prot or 0)) * factor
-            recipe_totals["carbs_g"] += (float(carb or 0)) * factor
-            recipe_totals["fat_g"] += (float(fat or 0)) * factor
+            # calories stored as kcal/gram in Grocy; macros userfields are per 100g
+            macro_factor = amount_g / 100.0
+            recipe_totals["calories_kcal"] += float(cal or 0) * amount_g
+            recipe_totals["protein_g"] += (float(prot or 0)) * macro_factor
+            recipe_totals["carbs_g"] += (float(carb or 0)) * macro_factor
+            recipe_totals["fat_g"] += (float(fat or 0)) * macro_factor
 
         for k in totals:
             totals[k] += recipe_totals[k]
