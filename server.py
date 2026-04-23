@@ -477,8 +477,7 @@ def purchase(product_name: str, amount: float, use_by: Optional[str] = None, loc
     unit_name = units.get(p.get("qu_id_stock"), "")
 
     payload: dict = {"amount": amount, "transaction_type": "purchase"}
-    if use_by:
-        payload["best_before_date"] = use_by
+    payload["best_before_date"] = use_by if use_by else "2999-12-31"
     api("post", f"/stock/products/{pid}/add", json=payload)
 
     parts = [f"Added {amount} {unit_name} × '{product_name}'"]
@@ -516,8 +515,7 @@ def batch_purchase(items: list[dict]) -> str:
             unit_name = units_cache.get(p.get("qu_id_stock"), "")
 
             payload: dict = {"amount": amount, "transaction_type": "purchase"}
-            if use_by:
-                payload["best_before_date"] = use_by
+            payload["best_before_date"] = use_by if use_by else "2999-12-31"
             api("post", f"/stock/products/{pid}/add", json=payload)
 
             suffix = f" (use by {use_by})" if use_by else ""
