@@ -1389,8 +1389,15 @@ def lookup_nutrition(product_name: str) -> dict:
         f"&fields=product_name,nutriments,brands"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "grocy-mcp/1.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            data = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"OpenFoodFacts is unreachable or returned an unexpected response: {exc}. "
+            "Call set_nutrition directly with known values instead."
+        ) from exc
 
     products = data.get("products", [])
     if not products:
