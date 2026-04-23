@@ -702,6 +702,9 @@ def update_product_unit(product_name: str, new_unit: str, new_total_amount: floa
     conv_id = conv["created_object_id"]
 
     try:
+        # Capture existing stock entries (with best_before dates) before wiping
+        existing_entries = api("get", f"/stock/products/{pid}/entries") or []
+
         # Zero out stock
         api("post", f"/stock/products/{pid}/inventory", json={"new_amount": 0, "best_before_date": "2999-12-31"})
 
@@ -710,8 +713,23 @@ def update_product_unit(product_name: str, new_unit: str, new_total_amount: floa
         patch.pop("userfields", None)
         api("put", f"/objects/products/{pid}", json=patch)
 
-        # Re-add with correct amount
-        api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount})
+        # Re-add stock, preserving best_before dates where possible.
+        # If existing entries exist, re-add each with its original date scaled to new_total_amount.
+        # Otherwise fall back to a single entry with no date.
+        if existing_entries:
+            original_total = sum(float(e.get("amount", 0)) for e in existing_entries)
+            scale = new_total_amount / original_total if original_total else 1.0
+            for entry in existing_entries:
+                entry_amount = float(entry.get("amount", 0)) * scale
+                if entry_amount <= 0:
+                    continue
+                bbd = entry.get("best_before_date") or "2999-12-31"
+                api("post", f"/stock/products/{pid}/add", json={
+                    "amount": entry_amount,
+                    "best_before_date": bbd,
+                })
+        else:
+            api("post", f"/stock/products/{pid}/add", json={"amount": new_total_amount})
     finally:
         api("delete", f"/objects/quantity_unit_conversions/{conv_id}")
 
