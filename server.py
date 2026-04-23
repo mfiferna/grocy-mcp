@@ -215,7 +215,7 @@ def _suggest_use_by(product_name: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def _get_or_create_product(name: str, location: Optional[str] = None) -> tuple[int, Optional[str]]:
+def _get_or_create_product(name: str, location: Optional[str] = None, default_unit: Optional[str] = None) -> tuple[int, Optional[str]]:
     """Return (product_id, creation_note). creation_note is non-None when product was just created."""
     pid, matches = _find_product(name)
     if pid:
@@ -248,12 +248,11 @@ def _get_or_create_product(name: str, location: Optional[str] = None) -> tuple[i
         loc_id = _infer_location_id(name, locations)
 
     if loc_id is None:
-        loc_id = next((l["id"] for l in locations if "pantry" in l["name"].lower()), None)
-    if loc_id is None and locations:
-        loc_id = locations[0]["id"]
-    if not loc_id:
-        r = api("post", "/objects/locations", json={"name": "Home"})
-        loc_id = r["created_object_id"]
+        valid = [l["name"] for l in locations]
+        raise ValueError(
+            f"Cannot infer storage location for '{name}'. "
+            f"Pass an explicit location parameter. Valid locations: {valid}"
+        )
 
     # Resolve unit
     inferred_unit_id, inferred_unit_name, package_size = _infer_unit(name, units)
@@ -261,15 +260,18 @@ def _get_or_create_product(name: str, location: Optional[str] = None) -> tuple[i
     if inferred_unit_id:
         unit_id = inferred_unit_id
         unit_note = inferred_unit_name
-    else:
-        # Fall back to "piece" explicitly, not random first
-        unit_id = _resolve_unit_id("piece", units)
-        if unit_id is None and units:
-            unit_id = units[0]["id"]
+    elif default_unit:
+        unit_id = _resolve_unit_id(default_unit, units)
         if unit_id is None:
-            r = api("post", "/objects/quantity_units", json={"name": "piece", "name_plural": "pieces"})
-            unit_id = r["created_object_id"]
-        unit_note = "piece (inferred)"
+            valid = [u["name"] for u in units]
+            raise ValueError(f"Unit '{default_unit}' not found. Valid units: {valid}")
+        unit_note = default_unit
+    else:
+        valid = [u["name"] for u in units]
+        raise ValueError(
+            f"Cannot infer unit for '{name}'. "
+            f"Pass an explicit default_unit parameter. Valid units: {valid}"
+        )
 
     result = api("post", "/objects/products", json={
         "name": name,
@@ -454,7 +456,7 @@ def find_product(name: str) -> dict:
 
 
 @mcp.tool
-def purchase(product_name: str, amount: float, use_by: str, location: Optional[str] = None) -> str:
+def purchase(product_name: str, amount: float, use_by: str, location: Optional[str] = None, default_unit: Optional[str] = None) -> str:
     """Add stock for a product. Creates the product automatically if it doesn't exist yet.
     Amount must be in the product's stock unit (e.g. grams for 'Cottage Cheese Fit 150g').
     For packaged goods: amount = package_size × package_count (e.g. 2 × 150g = 300).
@@ -462,14 +464,18 @@ def purchase(product_name: str, amount: float, use_by: str, location: Optional[s
     use_by is REQUIRED. Use 'never' for items with no meaningful expiry (pantry staples,
     spices, canned goods). Use YYYY-MM-DD for perishables. Call suggest_use_by if unsure.
 
+    When creating a new product, location and default_unit are REQUIRED if they cannot be
+    inferred from the product name (e.g. '500g' suffix → gram, 'milk' → Fridge).
+
     Args:
         product_name: Name of the product
         amount: Quantity to add, in the product's stock unit
         use_by: Best-before date as YYYY-MM-DD, or 'never' for no expiry
-        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry' (used when creating a new product)
+        location: Storage location e.g. 'Fridge', 'Freezer', 'Pantry' (required when creating a new product if not inferable)
+        default_unit: Unit for a new product e.g. 'gram', 'piece', 'liter' (required when creating a new product if not inferable)
     """
     try:
-        pid, creation_note = _get_or_create_product(product_name, location=location)
+        pid, creation_note = _get_or_create_product(product_name, location=location, default_unit=default_unit)
     except ValueError as e:
         return str(e)
 
@@ -499,8 +505,11 @@ def batch_purchase(items: list[dict]) -> str:
     use_by is REQUIRED for every item. Use 'never' for items with no meaningful expiry
     (pantry staples, spices, canned goods). Use YYYY-MM-DD for perishables.
 
+    When creating a new product, location and default_unit are REQUIRED if they cannot be
+    inferred from the product name.
+
     Args:
-        items: List of {product_name: str, amount: float, use_by: str (YYYY-MM-DD or 'never'), location: str (optional)}
+        items: List of {product_name: str, amount: float, use_by: str (YYYY-MM-DD or 'never'), location: str (optional), default_unit: str (optional)}
     """
     results = []
     units_cache: dict = {}
@@ -510,13 +519,14 @@ def batch_purchase(items: list[dict]) -> str:
         amount = float(item.get("amount", 1))
         use_by = item.get("use_by")
         location = item.get("location")
+        default_unit = item.get("default_unit")
 
         if not use_by:
             results.append(f"✗ {name}: use_by is required — provide a YYYY-MM-DD date or 'never'")
             continue
 
         try:
-            pid, creation_note = _get_or_create_product(name, location=location)
+            pid, creation_note = _get_or_create_product(name, location=location, default_unit=default_unit)
 
             if not units_cache:
                 units_cache = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
@@ -603,8 +613,11 @@ def create_product(name: str, default_unit: Optional[str] = None, location: Opti
     else:
         uid, unit_name, _ = _infer_unit(name, units)
         if uid is None:
-            uid = _resolve_unit_id("piece", units) or (units[0]["id"] if units else None)
-            unit_name = "piece (inferred)"
+            valid = [u["name"] for u in units]
+            return (
+                f"Cannot infer unit for '{name}'. "
+                f"Pass an explicit default_unit. Available units: {valid}"
+            )
 
     # Resolve location
     if location:
@@ -616,10 +629,12 @@ def create_product(name: str, default_unit: Optional[str] = None, location: Opti
     else:
         loc_id = _infer_location_id(name, locations)
         if loc_id is None:
-            loc_id = next((l["id"] for l in locations if "pantry" in l["name"].lower()), None)
-        if loc_id is None and locations:
-            loc_id = locations[0]["id"]
-        loc_name = next((l["name"] for l in locations if l["id"] == loc_id), "unknown") if loc_id else "none"
+            valid = [l["name"] for l in locations]
+            return (
+                f"Cannot infer location for '{name}'. "
+                f"Pass an explicit location. Available locations: {valid}"
+            )
+        loc_name = next((l["name"] for l in locations if l["id"] == loc_id), "unknown")
 
     payload: dict = {
         "name": name,
@@ -874,7 +889,7 @@ def create_recipe(
     errors = []
     for ing in ingredients:
         try:
-            pid, _ = _get_or_create_product(ing["product_name"])
+            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing.get("unit"))
             pos: dict = {
                 "recipe_id": recipe_id,
                 "product_id": pid,
@@ -928,7 +943,7 @@ def update_recipe(
         for pos in existing:
             api("delete", f"/objects/recipes_pos/{pos['id']}")
         for ing in ingredients:
-            pid, _ = _get_or_create_product(ing["product_name"])
+            pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing.get("unit"))
             pos: dict = {
                 "recipe_id": rid,
                 "product_id": pid,
@@ -1123,12 +1138,12 @@ def get_shopping_list() -> list[dict]:
 
 
 @mcp.tool
-def add_to_shopping_list(product_name: str, amount: float = 1, note: str = "") -> str:
+def add_to_shopping_list(product_name: str, amount: float, note: str = "") -> str:
     """Add an item to the shopping list. Creates the product if it doesn't exist.
 
     Args:
         product_name: Name of the product
-        amount: Quantity needed (default 1)
+        amount: Quantity needed (in the product's stock unit)
         note: Optional note (e.g. brand preference)
     """
     try:
