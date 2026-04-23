@@ -325,16 +325,19 @@ def _recipe_by_name(name: str) -> Optional[dict]:
 
 @mcp.tool
 def get_system_info() -> dict:
-    """Return available locations, quantity units, and stock summary.
+    """Return available locations, quantity units, meal plan sections, and stock summary.
     Call this at the start of a session before creating products or stock entries.
     """
     locations = api("get", "/objects/locations") or []
     units = api("get", "/objects/quantity_units") or []
     products = api("get", "/objects/products") or []
     stock = api("get", "/stock") or []
+    meal_sections_raw = api("get", "/objects/meal_plan_sections") or []
+    meal_sections = [s["name"] for s in sorted(meal_sections_raw, key=lambda s: s.get("sort_number", 0)) if s.get("name")]
     return {
         "locations": [l["name"] for l in locations],
         "quantity_units": [u["name"] for u in units],
+        "meal_plan_sections": meal_sections,
         "total_products": len(products),
         "products_in_stock": len(stock),
     }
@@ -1036,13 +1039,24 @@ def plan_week(entries: list[dict]) -> str:
     """Schedule multiple recipes for the week in one call.
 
     Args:
-        entries: List of {recipe_name: str, date: str (YYYY-MM-DD)}
+        entries: List of {recipe_name: str, date: str (YYYY-MM-DD), section: str}
     """
+    sections = {s["name"].lower(): s["id"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
+    section_names = list(sections.keys())
+
     results = []
     missing_summary = []
     for entry in entries:
         recipe_name = entry.get("recipe_name", "")
         date = entry.get("date", "")
+        section_str = entry.get("section", "")
+        if not section_str:
+            results.append(f"✗ {recipe_name}: 'section' is required. Available: {section_names}")
+            continue
+        section_id = sections.get(section_str.lower())
+        if section_id is None:
+            results.append(f"✗ {recipe_name}: unknown section '{section_str}'. Available: {section_names}")
+            continue
         recipe = _recipe_by_name(recipe_name)
         if not recipe:
             results.append(f"✗ {recipe_name}: recipe not found")
@@ -1051,9 +1065,10 @@ def plan_week(entries: list[dict]) -> str:
             "recipe_id": recipe["id"],
             "day": date,
             "recipe_servings": recipe.get("desired_servings", 1),
+            "section_id": section_id,
             "type": "recipe",
         })
-        line = f"✓ {date}: {recipe_name}"
+        line = f"✓ {date} [{section_str}]: {recipe_name}"
         try:
             f = api("get", f"/recipes/{recipe['id']}/fulfillment")
             if not f.get("need_fulfilled"):
@@ -1078,6 +1093,7 @@ def get_meal_plan(days_ahead: int = 7) -> list[dict]:
     entries = api("get", "/objects/meal_plan")
     recipes = {r["id"]: r["name"] for r in api("get", "/objects/recipes")}
     products = {p["id"]: p["name"] for p in api("get", "/objects/products")}
+    sections = {s["id"]: s["name"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
 
     today = datetime.now().date()
     cutoff = today + timedelta(days=days_ahead)
@@ -1094,6 +1110,8 @@ def get_meal_plan(days_ahead: int = 7) -> list[dict]:
         if day < today or day > cutoff:
             continue
         item: dict = {"date": day_str}
+        if e.get("section_id") and e["section_id"] in sections:
+            item["section"] = sections[e["section_id"]]
         if e.get("recipe_id"):
             item["recipe"] = recipes.get(e["recipe_id"], f"recipe_{e['recipe_id']}")
         elif e.get("product_id"):
@@ -1106,13 +1124,19 @@ def get_meal_plan(days_ahead: int = 7) -> list[dict]:
 
 
 @mcp.tool
-def add_to_meal_plan(recipe_name: str, date: str) -> str:
+def add_to_meal_plan(recipe_name: str, date: str, section: str) -> str:
     """Schedule a recipe on a specific date.
 
     Args:
         recipe_name: Name of the recipe
         date: Date in YYYY-MM-DD format
+        section: Meal section e.g. 'Breakfast', 'Lunch', 'Dinner', 'Afternoon snack'.
+            Call get_system_info to see available sections.
     """
+    sections = {s["name"].lower(): s["id"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
+    section_id = sections.get(section.lower())
+    if section_id is None:
+        raise ValueError(f"Unknown section '{section}'. Available: {list(sections.keys())}")
     recipe = _recipe_by_name(recipe_name)
     if not recipe:
         return f"Recipe '{recipe_name}' not found."
@@ -1120,9 +1144,10 @@ def add_to_meal_plan(recipe_name: str, date: str) -> str:
         "recipe_id": recipe["id"],
         "day": date,
         "recipe_servings": recipe.get("desired_servings", 1),
+        "section_id": section_id,
         "type": "recipe",
     })
-    msg = f"Scheduled '{recipe_name}' for {date}."
+    msg = f"Scheduled '{recipe_name}' for {date} [{section}]."
     try:
         f = api("get", f"/recipes/{recipe['id']}/fulfillment")
         if not f.get("need_fulfilled"):
