@@ -579,8 +579,12 @@ def consume(product_name: str, amount: float) -> str:
         if matches:
             return f"Ambiguous: did you mean one of {[m['name'] for m in matches[:5]]}?"
         return f"Product '{product_name}' not found in stock."
+    products = api("get", "/objects/products") or []
+    p = next((x for x in products if x["id"] == pid), {})
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    unit_name = units.get(p.get("qu_id_stock"), "")
     api("post", f"/stock/products/{pid}/consume", json={"amount": amount, "transaction_type": "consume"})
-    return f"Consumed {amount} × '{product_name}'."
+    return f"Consumed {amount} {unit_name} × '{product_name}'."
 
 
 @mcp.tool
@@ -616,8 +620,12 @@ def adjust_stock(product_name: str, new_amount: float, use_by: str) -> str:
         "transaction_type": "purchase",
         "best_before_date": bbd,
     })
+    products = api("get", "/objects/products") or []
+    p = next((x for x in products if x["id"] == pid), {})
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    unit_name = units.get(p.get("qu_id_stock"), "")
     expiry_label = "no expiry" if use_by.lower() == "never" else f"use by {use_by}"
-    return f"'{product_name}' stock set to {new_amount} ({expiry_label})."
+    return f"'{product_name}' stock set to {new_amount} {unit_name} ({expiry_label})."
 
 
 @mcp.tool
@@ -909,6 +917,9 @@ def create_recipe(
         ingredients: List of {product_name: str, amount: float, unit: str}
         description: Recipe description or cooking instructions as HTML (e.g. <p>Step 1...</p><p>Step 2...</p>)
     """
+    if not ingredients:
+        raise ValueError("A recipe must have at least one ingredient.")
+
     missing_units = [ing.get("product_name") for ing in ingredients if not ing.get("unit")]
     if missing_units:
         raise ValueError(
@@ -1159,6 +1170,50 @@ def add_to_meal_plan(recipe_name: str, date: str, section: str) -> str:
 
 
 @mcp.tool
+def add_product_to_meal_plan(product_name: str, date: str, section: str, amount: float, unit: Optional[str] = None) -> str:
+    """Schedule a specific product (not a recipe) on a date — e.g. a snack or standalone item.
+
+    Args:
+        product_name: Name of the product
+        date: Date in YYYY-MM-DD format
+        section: Meal section e.g. 'Breakfast', 'Lunch', 'Dinner'. Call get_system_info to see available sections.
+        amount: Quantity of the product
+        unit: Unit name (e.g. 'gram', 'piece'). Defaults to the product's stock unit.
+    """
+    sections = {s["name"].lower(): s["id"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
+    section_id = sections.get(section.lower())
+    if section_id is None:
+        raise ValueError(f"Unknown section '{section}'. Available: {list(sections.keys())}")
+
+    pid, matches = _find_product(product_name)
+    if not pid:
+        if matches:
+            return f"Ambiguous: did you mean one of {[m['name'] for m in matches[:5]]}?"
+        return f"Product '{product_name}' not found."
+
+    qu_id: Optional[int] = None
+    if unit:
+        qu_id = _unit_id(unit)
+        if qu_id is None:
+            units = api("get", "/objects/quantity_units") or []
+            return f"Unit '{unit}' not found. Available: {[u['name'] for u in units]}"
+    else:
+        products = api("get", "/objects/products") or []
+        p = next((x for x in products if x["id"] == pid), {})
+        qu_id = p.get("qu_id_stock")
+
+    api("post", "/objects/meal_plan", json={
+        "type": "product",
+        "product_id": pid,
+        "product_amount": amount,
+        "product_qu_id": qu_id,
+        "section_id": section_id,
+        "day": date,
+    })
+    return f"Scheduled {amount} × '{product_name}' for {date} [{section}]."
+
+
+@mcp.tool
 def delete_meal_plan_entry(date: str, recipe_name: str) -> str:
     """Remove a recipe from the meal plan on a given date.
 
@@ -1244,17 +1299,26 @@ def remove_from_shopping_list(product_name: str) -> str:
 # Tools — Nutrition
 # ---------------------------------------------------------------------------
 
-_WEIGHT_VOLUME_UNITS = {"gram", "g", "kilogram", "kg", "ml", "milliliter", "millilitre", "liter", "litre", "l"}
+# Maps lowercase unit name → grams (or ml) per unit.
+# Absent key = discrete unit (piece, pack, …).
+_UNIT_GRAMS: dict[str, float] = {
+    "gram": 1.0, "g": 1.0,
+    "kilogram": 1000.0, "kg": 1000.0,
+    "milliliter": 1.0, "ml": 1.0, "millilitre": 1.0,
+    "liter": 1000.0, "l": 1000.0, "litre": 1000.0,
+}
 
 
-def _product_unit_name(product: dict) -> str:
+def _product_unit_name(product: dict, units: Optional[dict] = None) -> str:
     """Return the lowercase stock unit name for a product object."""
-    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
+    if units is None:
+        units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
     return (units.get(product.get("qu_id_stock")) or "").lower()
 
 
-def _is_weight_or_volume(unit_name: str) -> bool:
-    return unit_name in _WEIGHT_VOLUME_UNITS
+def _grams_per_unit(unit_name: str) -> float:
+    """Grams (or ml) per unit. Returns 0.0 for discrete units."""
+    return _UNIT_GRAMS.get(unit_name.lower(), 0.0)
 
 
 @mcp.tool
@@ -1270,25 +1334,26 @@ def get_nutrition(product_name: str) -> dict:
             return {"error": f"Ambiguous: {[m['name'] for m in matches[:5]]}"}
         return {"error": f"Product '{product_name}' not found."}
 
+    units_map = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
     products = api("get", "/objects/products") or []
     product = next((p for p in products if p["id"] == pid), {})
-    unit_name = _product_unit_name(product)
-    weight_vol = _is_weight_or_volume(unit_name)
+    unit_name = _product_unit_name(product, units_map)
+    gpunit = _grams_per_unit(unit_name)
 
     userfields = api("get", f"/userfields/products/{pid}") or {}
 
     cal_raw = product.get("calories")
     if cal_raw not in (None, "", 0):
-        if weight_vol:
-            # Stored as kcal/gram; multiply back to per-100g for display
-            cal_display = round(float(cal_raw) * 100, 2)
+        if gpunit:
+            # Stored as kcal/stock_unit. Convert to kcal/100g for display.
+            cal_display = round(float(cal_raw) / gpunit * 100.0, 2)
         else:
             # Stored as kcal/piece (or other discrete unit)
             cal_display = float(cal_raw)
     else:
         cal_display = None
 
-    per = "100g" if weight_vol else f"piece"
+    per = "100g" if gpunit else unit_name or "piece"
     return {
         "product": product.get("name", product_name),
         "calories_kcal": cal_display,
@@ -1330,29 +1395,35 @@ def set_nutrition(
             return f"Ambiguous: {[m['name'] for m in matches[:5]]}"
         return f"Product '{product_name}' not found."
 
+    units_map = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
     products = api("get", "/objects/products") or []
     product = next((p for p in products if p["id"] == pid), {})
-    unit_name = _product_unit_name(product)
-    weight_vol = _is_weight_or_volume(unit_name)
+    unit_name = _product_unit_name(product, units_map)
+    gpunit = _grams_per_unit(unit_name)
 
     # Validate the declared unit makes sense for this product's stock unit
-    if nutrition_unit in ("100g", "100ml") and not weight_vol:
+    if nutrition_unit in ("100g", "100ml") and not gpunit:
         raise ValueError(
             f"Product '{product_name}' has stock unit '{unit_name}' (not weight/volume). "
             f"Use nutrition_unit='piece' instead."
         )
-    if nutrition_unit == "piece" and weight_vol:
+    if nutrition_unit == "piece" and gpunit:
         raise ValueError(
             f"Product '{product_name}' has stock unit '{unit_name}' (weight/volume). "
             f"Use nutrition_unit='100g' or '100ml' instead."
         )
 
     if calories_kcal is not None:
+        if calories_kcal > 950:
+            raise ValueError(
+                f"calories_kcal={calories_kcal} looks wrong — maximum realistic value is ~900 kcal/100g (pure fat). "
+                "Did you mean to pass kcal per 100g/100ml (not per gram or per kg)?"
+            )
         patch = {k: v for k, v in product.items() if k != "userfields"}
-        if weight_vol:
-            # Grocy's "calories" field is kcal per stock unit (kcal/gram).
-            # We receive per-100g/100ml so divide by 100.
-            patch["calories"] = calories_kcal / 100.0
+        if gpunit:
+            # Grocy stores kcal per stock unit. Convert from kcal/100g:
+            # kcal/stock_unit = kcal/100g * (grams_per_unit / 100)
+            patch["calories"] = calories_kcal * (gpunit / 100.0)
         else:
             # Piece-based: store kcal/piece directly
             patch["calories"] = calories_kcal
@@ -1469,6 +1540,7 @@ def get_day_nutrition(date: str) -> dict:
     entries = api("get", "/objects/meal_plan") or []
     recipes_map = {r["id"]: r for r in (api("get", "/objects/recipes") or [])}
     products_map = {p["id"]: p for p in (api("get", "/objects/products") or [])}
+    units_map = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
 
     totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
     breakdown = []
@@ -1495,8 +1567,10 @@ def get_day_nutrition(date: str) -> dict:
             pid = pos.get("product_id")
             amount = float(pos.get("amount", 0)) * scale
             product = products_map.get(pid, {})
-            unit_name = _product_unit_name(product)
-            is_wv = _is_weight_or_volume(unit_name)
+            stock_unit_name = _product_unit_name(product, units_map)
+            stock_gpunit = _grams_per_unit(stock_unit_name)
+            pos_unit_name = (units_map.get(pos.get("qu_id")) or "").lower()
+            pos_gpunit = _grams_per_unit(pos_unit_name) if pos_unit_name else stock_gpunit
             userfields = api("get", f"/userfields/products/{pid}") or {}
 
             cal = product.get("calories")
@@ -1508,12 +1582,14 @@ def get_day_nutrition(date: str) -> dict:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
 
-            if is_wv:
-                # calories stored as kcal/gram; macros per 100g
-                recipe_totals["calories_kcal"] += float(cal or 0) * amount
-                macro_factor = amount / 100.0
+            if stock_gpunit and pos_gpunit:
+                # Stored as kcal/stock_unit. Convert pos amount to stock units, then multiply.
+                amount_in_stock_units = amount * pos_gpunit / stock_gpunit
+                recipe_totals["calories_kcal"] += float(cal or 0) * amount_in_stock_units
+                # Macros stored per 100g: convert pos amount to grams for macro_factor
+                macro_factor = amount * pos_gpunit / 100.0
             else:
-                # calories stored as kcal/piece; macros per piece
+                # Discrete unit (piece): kcal/piece stored directly
                 recipe_totals["calories_kcal"] += float(cal or 0) * amount
                 macro_factor = amount
             recipe_totals["protein_g"] += float(prot or 0) * macro_factor
