@@ -885,14 +885,19 @@ def get_recipe(name: str) -> dict:
     products = {p["id"]: p for p in api("get", "/objects/products")}
     units = {u["id"]: u["name"] for u in api("get", "/objects/quantity_units")}
 
-    ingredients = [
-        {
-            "product": products.get(pos.get("product_id"), {}).get("name", f"product_{pos.get('product_id')}"),
-            "amount": float(pos.get("amount", 0)),
+    ingredients = []
+    for pos in positions:
+        product = products.get(pos.get("product_id"), {})
+        stock_unit_name = (units.get(product.get("qu_id_stock")) or "").lower()
+        display_unit_name = (units.get(pos.get("qu_id")) or "").lower()
+        stock_amount = float(pos.get("amount", 0))
+        # API returns amount in stock units; convert to display unit for readability
+        display_amount = _from_stock_amount(stock_amount, stock_unit_name, display_unit_name)
+        ingredients.append({
+            "product": product.get("name", f"product_{pos.get('product_id')}"),
+            "amount": display_amount,
             "unit": units.get(pos.get("qu_id")),
-        }
-        for pos in positions
-    ]
+        })
 
     return {
         "name": recipe["name"],
@@ -934,6 +939,8 @@ def create_recipe(
         "base_servings": servings,
     })
     recipe_id = result["created_object_id"]
+    all_products = api("get", "/objects/products") or []
+    units_map = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
     errors = []
     for ing in ingredients:
         try:
@@ -941,10 +948,13 @@ def create_recipe(
             uid = _unit_id(ing["unit"])
             if not uid:
                 raise ValueError(f"unknown unit '{ing['unit']}'")
+            product = next((p for p in all_products if p["id"] == pid), {})
+            stock_unit_name = (units_map.get(product.get("qu_id_stock")) or ing["unit"]).lower()
+            amount_in_stock = _to_stock_amount(float(ing["amount"]), ing["unit"], stock_unit_name)
             pos: dict = {
                 "recipe_id": recipe_id,
                 "product_id": pid,
-                "amount": ing["amount"],
+                "amount": amount_in_stock,
                 "qu_id": uid,
                 "only_check_single_unit_in_stock": 0,
             }
@@ -996,15 +1006,20 @@ def update_recipe(
         existing = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={rid}"})
         for pos in existing:
             api("delete", f"/objects/recipes_pos/{pos['id']}")
+        all_products = api("get", "/objects/products") or []
+        units_map = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or [])}
         for ing in ingredients:
             pid, _ = _get_or_create_product(ing["product_name"], default_unit=ing["unit"])
             uid = _unit_id(ing["unit"])
             if not uid:
                 raise ValueError(f"unknown unit '{ing['unit']}' for {ing['product_name']}")
+            product = next((p for p in all_products if p["id"] == pid), {})
+            stock_unit_name = (units_map.get(product.get("qu_id_stock")) or ing["unit"]).lower()
+            amount_in_stock = _to_stock_amount(float(ing["amount"]), ing["unit"], stock_unit_name)
             pos: dict = {
                 "recipe_id": rid,
                 "product_id": pid,
-                "amount": ing["amount"],
+                "amount": amount_in_stock,
                 "qu_id": uid,
                 "only_check_single_unit_in_stock": 0,
             }
@@ -1321,6 +1336,25 @@ def _grams_per_unit(unit_name: str) -> float:
     return _UNIT_GRAMS.get(unit_name.lower(), 0.0)
 
 
+def _to_stock_amount(amount: float, from_unit: str, to_stock_unit: str) -> float:
+    """Convert an amount from from_unit into the product's stock unit.
+    Both must be weight/volume units; discrete units pass through unchanged."""
+    f = _grams_per_unit(from_unit)
+    t = _grams_per_unit(to_stock_unit)
+    if f and t:
+        return amount * f / t
+    return amount  # discrete or unknown — pass through
+
+
+def _from_stock_amount(stock_amount: float, stock_unit: str, display_unit: str) -> float:
+    """Convert a stock-unit amount into a human-readable display unit."""
+    f = _grams_per_unit(stock_unit)
+    t = _grams_per_unit(display_unit)
+    if f and t:
+        return stock_amount * f / t
+    return stock_amount
+
+
 @mcp.tool
 def get_nutrition(product_name: str) -> dict:
     """Get nutrition info (calories, protein, carbs, fat per 100g) for a product.
@@ -1345,8 +1379,8 @@ def get_nutrition(product_name: str) -> dict:
     cal_raw = product.get("calories")
     if cal_raw not in (None, "", 0):
         if gpunit:
-            # Stored as kcal/gram. Multiply by 100 to display as kcal/100g.
-            cal_display = round(float(cal_raw) * 100.0, 2)
+            # Stored as kcal/stock_unit. Convert to kcal/100g for display.
+            cal_display = round(float(cal_raw) / gpunit * 100.0, 2)
         else:
             # Stored as kcal/piece (or other discrete unit)
             cal_display = float(cal_raw)
@@ -1421,11 +1455,10 @@ def set_nutrition(
             )
         patch = {k: v for k, v in product.items() if k != "userfields"}
         if gpunit:
-            # Store as kcal/gram regardless of stock unit (gram, kilogram, liter, ml).
-            # Grocy's recipe calorie display multiplies stored × recipe_amount directly
-            # without unit conversion, so gram-normalised storage + gram recipe positions
-            # gives correct results in both Grocy and get_day_nutrition.
-            patch["calories"] = calories_kcal / 100.0
+            # Store as kcal/stock_unit. Grocy multiplies stored × stock_amount for
+            # recipe calorie display, so this is consistent end-to-end.
+            # kcal/100g → kcal/stock_unit = kcal/100g * (grams_per_unit / 100)
+            patch["calories"] = calories_kcal * (gpunit / 100.0)
         else:
             # Piece-based: store kcal/piece directly
             patch["calories"] = calories_kcal
@@ -1569,11 +1602,8 @@ def get_day_nutrition(date: str) -> dict:
             pid = pos.get("product_id")
             amount = float(pos.get("amount", 0)) * scale
             product = products_map.get(pid, {})
-            pos_unit_name = (units_map.get(pos.get("qu_id")) or "").lower()
-            if not pos_unit_name:
-                stock_unit_name = _product_unit_name(product, units_map)
-                pos_unit_name = stock_unit_name
-            pos_gpunit = _grams_per_unit(pos_unit_name)
+            stock_unit_name = _product_unit_name(product, units_map)
+            stock_gpunit = _grams_per_unit(stock_unit_name)
             userfields = api("get", f"/userfields/products/{pid}") or {}
 
             cal = product.get("calories")
@@ -1585,11 +1615,11 @@ def get_day_nutrition(date: str) -> dict:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
 
-            if pos_gpunit:
-                # Stored as kcal/gram. Convert recipe amount to grams, then multiply.
-                amount_grams = amount * pos_gpunit
-                recipe_totals["calories_kcal"] += float(cal or 0) * amount_grams
-                macro_factor = amount_grams / 100.0
+            if stock_gpunit:
+                # amount is in stock units; cal is kcal/stock_unit
+                recipe_totals["calories_kcal"] += float(cal or 0) * amount
+                # macros stored per 100g: convert stock-unit amount to grams
+                macro_factor = amount * stock_gpunit / 100.0
             else:
                 # Discrete unit (piece): kcal/piece stored directly
                 recipe_totals["calories_kcal"] += float(cal or 0) * amount
