@@ -1345,8 +1345,8 @@ def get_nutrition(product_name: str) -> dict:
     cal_raw = product.get("calories")
     if cal_raw not in (None, "", 0):
         if gpunit:
-            # Stored as kcal/stock_unit. Convert to kcal/100g for display.
-            cal_display = round(float(cal_raw) / gpunit * 100.0, 2)
+            # Stored as kcal/gram. Multiply by 100 to display as kcal/100g.
+            cal_display = round(float(cal_raw) * 100.0, 2)
         else:
             # Stored as kcal/piece (or other discrete unit)
             cal_display = float(cal_raw)
@@ -1421,9 +1421,11 @@ def set_nutrition(
             )
         patch = {k: v for k, v in product.items() if k != "userfields"}
         if gpunit:
-            # Grocy stores kcal per stock unit. Convert from kcal/100g:
-            # kcal/stock_unit = kcal/100g * (grams_per_unit / 100)
-            patch["calories"] = calories_kcal * (gpunit / 100.0)
+            # Store as kcal/gram regardless of stock unit (gram, kilogram, liter, ml).
+            # Grocy's recipe calorie display multiplies stored × recipe_amount directly
+            # without unit conversion, so gram-normalised storage + gram recipe positions
+            # gives correct results in both Grocy and get_day_nutrition.
+            patch["calories"] = calories_kcal / 100.0
         else:
             # Piece-based: store kcal/piece directly
             patch["calories"] = calories_kcal
@@ -1567,10 +1569,11 @@ def get_day_nutrition(date: str) -> dict:
             pid = pos.get("product_id")
             amount = float(pos.get("amount", 0)) * scale
             product = products_map.get(pid, {})
-            stock_unit_name = _product_unit_name(product, units_map)
-            stock_gpunit = _grams_per_unit(stock_unit_name)
             pos_unit_name = (units_map.get(pos.get("qu_id")) or "").lower()
-            pos_gpunit = _grams_per_unit(pos_unit_name) if pos_unit_name else stock_gpunit
+            if not pos_unit_name:
+                stock_unit_name = _product_unit_name(product, units_map)
+                pos_unit_name = stock_unit_name
+            pos_gpunit = _grams_per_unit(pos_unit_name)
             userfields = api("get", f"/userfields/products/{pid}") or {}
 
             cal = product.get("calories")
@@ -1582,12 +1585,11 @@ def get_day_nutrition(date: str) -> dict:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
 
-            if stock_gpunit and pos_gpunit:
-                # Stored as kcal/stock_unit. Convert pos amount to stock units, then multiply.
-                amount_in_stock_units = amount * pos_gpunit / stock_gpunit
-                recipe_totals["calories_kcal"] += float(cal or 0) * amount_in_stock_units
-                # Macros stored per 100g: convert pos amount to grams for macro_factor
-                macro_factor = amount * pos_gpunit / 100.0
+            if pos_gpunit:
+                # Stored as kcal/gram. Convert recipe amount to grams, then multiply.
+                amount_grams = amount * pos_gpunit
+                recipe_totals["calories_kcal"] += float(cal or 0) * amount_grams
+                macro_factor = amount_grams / 100.0
             else:
                 # Discrete unit (piece): kcal/piece stored directly
                 recipe_totals["calories_kcal"] += float(cal or 0) * amount
