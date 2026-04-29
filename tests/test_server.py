@@ -39,6 +39,8 @@ class ServerTests(unittest.TestCase):
                 {"id": 2, "name": "Lunch"},
             ],
             ("get", "/objects/quantity_units"): [{"id": 1, "name": "gram"}],
+            ("get", "/userfields/products/10"): {},
+            ("get", "/objects/recipes_pos"): [],
         }
 
         def fake_api(method, path, **kwargs):
@@ -60,12 +62,14 @@ class ServerTests(unittest.TestCase):
                     "product": "Greek Yogurt",
                     "amount": 150.0,
                     "unit": "gram",
+                    "day_total_incomplete": True,
                 },
                 {
                     "date": "2026-04-29",
                     "section": "Breakfast",
                     "type": "recipe",
                     "recipe": "Omelette",
+                    "day_total_incomplete": True,
                 },
             ],
         )

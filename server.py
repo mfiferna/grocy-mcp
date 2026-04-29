@@ -1132,7 +1132,8 @@ def get_meal_plan(days_ahead: int = 7, days_back: int = 0) -> list[dict]:
         raise ValueError("days_back must be >= 0")
 
     entries = api("get", "/objects/meal_plan")
-    recipes = {r["id"]: r["name"] for r in api("get", "/objects/recipes")}
+    recipes_map = {r["id"]: r for r in (api("get", "/objects/recipes") or [])}
+    recipes = {rid: recipe["name"] for rid, recipe in recipes_map.items()}
     products = {p["id"]: p for p in api("get", "/objects/products")}
     sections = {s["id"]: s["name"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
     units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or []) if u.get("name")}
@@ -1142,6 +1143,8 @@ def get_meal_plan(days_ahead: int = 7, days_back: int = 0) -> list[dict]:
     cutoff = today + timedelta(days=days_ahead)
 
     out = []
+    day_totals: dict[str, float] = {}
+    day_incomplete: dict[str, bool] = {}
     for e in entries:
         day_str = (e.get("day") or "")[:10]
         if not day_str:
@@ -1170,9 +1173,22 @@ def get_meal_plan(days_ahead: int = 7, days_back: int = 0) -> list[dict]:
         elif e.get("note"):
             item["type"] = "note"
             item["note"] = e["note"]
+
+        entry_totals, missing_names, entry_type, _ = _meal_plan_entry_nutrition(
+            e,
+            recipes_map,
+            products,
+            units,
+        )
+        if entry_type in {"recipe", "product"}:
+            if entry_totals is not None:
+                item["energy_kcal"] = round(entry_totals["calories_kcal"], 1)
+                day_totals[day_str] = day_totals.get(day_str, 0.0) + entry_totals["calories_kcal"]
+            if missing_names or entry_totals is None:
+                day_incomplete[day_str] = True
         out.append(item)
 
-    return sorted(
+    sorted_out = sorted(
         out,
         key=lambda x: (
             x["date"],
@@ -1180,6 +1196,13 @@ def get_meal_plan(days_ahead: int = 7, days_back: int = 0) -> list[dict]:
             x.get("recipe") or x.get("product") or x.get("note", ""),
         ),
     )
+    for item in sorted_out:
+        day_str = item["date"]
+        if day_str in day_totals:
+            item["day_total_kcal"] = round(day_totals.get(day_str, 0.0), 1)
+        if day_incomplete.get(day_str):
+            item["day_total_incomplete"] = True
+    return sorted_out
 
 
 @mcp.tool
@@ -1497,6 +1520,75 @@ def _nutrition_totals_for_product_amount(
     return totals
 
 
+def _meal_plan_entry_nutrition(
+    entry: dict,
+    recipes_map: dict,
+    products_map: dict,
+    units_map: dict,
+) -> tuple[Optional[dict], list[str], Optional[str], Optional[str]]:
+    """Return (totals, missing_names, entry_type, entry_name) for one meal-plan entry."""
+    if entry.get("product_id"):
+        pid = entry["product_id"]
+        product = products_map.get(pid)
+        if not product:
+            return None, [], "product", f"product_{pid}"
+        amount = float(entry.get("product_amount") or 0)
+        amount_unit_name = units_map.get(entry.get("product_qu_id")) or _product_unit_name(product, units_map)
+        userfields = api("get", f"/userfields/products/{pid}") or {}
+        totals = _nutrition_totals_for_product_amount(
+            product,
+            amount,
+            amount_unit_name,
+            units_map,
+            userfields,
+        )
+        name = product.get("name", f"product_{pid}")
+        if totals is None:
+            return None, [name], "product", name
+        return totals, [], "product", name
+
+    if not entry.get("recipe_id"):
+        return None, [], None, None
+
+    recipe = recipes_map.get(entry["recipe_id"])
+    if not recipe:
+        return None, [], "recipe", f"recipe_{entry['recipe_id']}"
+
+    servings = float(entry.get("recipe_servings") or recipe.get("desired_servings") or 1)
+    base_servings = float(recipe.get("base_servings") or recipe.get("desired_servings") or 1)
+    scale = servings / base_servings if base_servings else 1.0
+    positions = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe['id']}"}) or []
+
+    recipe_totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+    missing = []
+    has_data = False
+
+    for pos in positions:
+        pid = pos.get("product_id")
+        amount = float(pos.get("amount", 0)) * scale
+        product = products_map.get(pid, {})
+        userfields = api("get", f"/userfields/products/{pid}") or {}
+        item_totals = _nutrition_totals_for_product_amount(
+            product,
+            amount,
+            _product_unit_name(product, units_map),
+            units_map,
+            userfields,
+        )
+        if item_totals is None:
+            missing.append(product.get("name", f"product_{pid}"))
+            continue
+        has_data = True
+        for key in recipe_totals:
+            recipe_totals[key] += item_totals[key]
+
+    if not has_data and not positions:
+        return None, [], "recipe", recipe["name"]
+    if not has_data and missing:
+        return None, missing, "recipe", recipe["name"]
+    return recipe_totals, missing, "recipe", recipe["name"]
+
+
 @mcp.tool
 def get_nutrition(product_name: str) -> dict:
     """Get nutrition info (calories, protein, carbs, fat per 100g) for a product.
@@ -1728,75 +1820,25 @@ def get_day_nutrition(date: str) -> dict:
         return {"date": date, "error": "No meal plan entries for this date."}
 
     for entry in day_entries:
-        if entry.get("product_id"):
-            pid = entry["product_id"]
-            product = products_map.get(pid)
-            if not product:
-                continue
-            amount = float(entry.get("product_amount") or 0)
-            amount_unit_name = units_map.get(entry.get("product_qu_id")) or _product_unit_name(product, units_map)
-            userfields = api("get", f"/userfields/products/{pid}") or {}
-            product_totals = _nutrition_totals_for_product_amount(
-                product,
-                amount,
-                amount_unit_name,
-                units_map,
-                userfields,
-            )
-            if product_totals is None:
-                no_data.append(product.get("name", f"product_{pid}"))
-                continue
-
-            for k in totals:
-                totals[k] += product_totals[k]
-            breakdown.append(
-                {
-                    "type": "product",
-                    "item": product["name"],
-                    "product": product["name"],
-                    **{k: round(v, 1) for k, v in product_totals.items()},
-                }
-            )
+        entry_totals, missing_names, entry_type, entry_name = _meal_plan_entry_nutrition(
+            entry,
+            recipes_map,
+            products_map,
+            units_map,
+        )
+        no_data.extend(missing_names)
+        if entry_type is None or entry_name is None:
             continue
-
-        if not entry.get("recipe_id"):
+        if entry_totals is None:
             continue
-        recipe = recipes_map.get(entry["recipe_id"])
-        if not recipe:
-            continue
-        servings = float(entry.get("recipe_servings") or recipe.get("desired_servings") or 1)
-        base_servings = float(recipe.get("base_servings") or recipe.get("desired_servings") or 1)
-        scale = servings / base_servings if base_servings else 1.0
-
-        positions = api("get", "/objects/recipes_pos", params={"query[]": f"recipe_id={recipe['id']}"}) or []
-        recipe_totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
-
-        for pos in positions:
-            pid = pos.get("product_id")
-            amount = float(pos.get("amount", 0)) * scale
-            product = products_map.get(pid, {})
-            userfields = api("get", f"/userfields/products/{pid}") or {}
-            item_totals = _nutrition_totals_for_product_amount(
-                product,
-                amount,
-                _product_unit_name(product, units_map),
-                units_map,
-                userfields,
-            )
-            if item_totals is None:
-                no_data.append(product.get("name", f"product_{pid}"))
-                continue
-            for k in recipe_totals:
-                recipe_totals[k] += item_totals[k]
-
         for k in totals:
-            totals[k] += recipe_totals[k]
+            totals[k] += entry_totals[k]
         breakdown.append(
             {
-                "type": "recipe",
-                "item": recipe["name"],
-                "recipe": recipe["name"],
-                **{k: round(v, 1) for k, v in recipe_totals.items()},
+                "type": entry_type,
+                "item": entry_name,
+                entry_type: entry_name,
+                **{k: round(v, 1) for k, v in entry_totals.items()},
             }
         )
 
