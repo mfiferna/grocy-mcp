@@ -43,3 +43,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Trigger stack redeploy via PortainerBro
+        run: |
+          curl -sf -X POST \
+            -u "${{ secrets.PORTAINERBRO_USER }}:${{ secrets.PORTAINERBRO_PASSWORD }}" \
+            "${{ secrets.PORTAINERBRO_URL }}/api/redeploy/name/grocy-mcp"
