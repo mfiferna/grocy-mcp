@@ -22,7 +22,9 @@ mcp = FastMCP(
         "When adding stock for packaged goods, amount must be in the product's stock unit: "
         "e.g. 2 × 150g packages → amount=300 (grams). "
         "If unsure about a product's unit, call get_product_details first. "
-        "If unsure about use-by date, call suggest_use_by."
+        "If unsure about use-by date, call suggest_use_by. "
+        "Use get_meal_plan(days_back=...) when you need to inspect or correct past meal-plan entries. "
+        "Use add_product_to_meal_plan for standalone products such as snacks or drinks."
     ),
 )
 
@@ -145,9 +147,20 @@ _USE_BY_DAYS: list[tuple[str, int]] = [
 ]
 
 
-def _resolve_unit_id(canonical: str, units: list[dict]) -> Optional[int]:
-    """Return unit id for a canonical name like 'gram', 'kilogram', 'liter', 'piece'."""
-    canonical_lower = canonical.lower()
+def _canonical_unit_name(name: str) -> str:
+    """Normalize a unit name or alias to a canonical unit key."""
+    name_lower = name.strip().lower()
+    if name_lower in _UNIT_ALIASES:
+        return name_lower
+    for canonical, aliases in _UNIT_ALIASES.items():
+        if name_lower in aliases:
+            return canonical
+    return name_lower
+
+
+def _resolve_unit_id(name: str, units: list[dict]) -> Optional[int]:
+    """Return unit id for a real or aliased unit name like 'gram', 'g', or 'grams'."""
+    canonical_lower = _canonical_unit_name(name)
     aliases = _UNIT_ALIASES.get(canonical_lower, [canonical_lower])
     for u in units:
         u_name = u["name"].lower()
@@ -265,7 +278,7 @@ def _get_or_create_product(name: str, location: Optional[str] = None, default_un
         if unit_id is None:
             valid = [u["name"] for u in units]
             raise ValueError(f"Unit '{default_unit}' not found. Valid units: {valid}")
-        unit_note = default_unit
+        unit_note = _canonical_unit_name(default_unit)
     else:
         valid = [u["name"] for u in units]
         raise ValueError(
@@ -287,12 +300,8 @@ def _get_or_create_product(name: str, location: Optional[str] = None, default_un
 
 
 def _unit_id(name: str) -> Optional[int]:
-    units = api("get", "/objects/quantity_units")
-    name_lower = name.lower()
-    for u in units:
-        if u["name"].lower() == name_lower or (u.get("name_plural") or "").lower() == name_lower:
-            return u["id"]
-    return None
+    units = api("get", "/objects/quantity_units") or []
+    return _resolve_unit_id(name, units)
 
 
 def _location_id(name: str) -> Optional[int]:
@@ -647,7 +656,7 @@ def create_product(name: str, default_unit: Optional[str] = None, location: Opti
         if uid is None:
             valid = [u["name"] for u in units]
             return f"Unit '{default_unit}' not found. Available units: {valid}"
-        unit_name = default_unit
+        unit_name = _canonical_unit_name(default_unit)
     else:
         uid, unit_name, _ = _infer_unit(name, units)
         if uid is None:
@@ -1110,18 +1119,26 @@ def plan_week(entries: list[dict]) -> str:
     return "\n".join(results)
 
 @mcp.tool
-def get_meal_plan(days_ahead: int = 7) -> list[dict]:
-    """Get the meal plan from today for the next N days.
+def get_meal_plan(days_ahead: int = 7, days_back: int = 0) -> list[dict]:
+    """Get the meal plan around today, including optional past days.
 
     Args:
         days_ahead: How many days ahead to show (default 7)
+        days_back: How many days back to include (default 0)
     """
+    if days_ahead < 0:
+        raise ValueError("days_ahead must be >= 0")
+    if days_back < 0:
+        raise ValueError("days_back must be >= 0")
+
     entries = api("get", "/objects/meal_plan")
     recipes = {r["id"]: r["name"] for r in api("get", "/objects/recipes")}
-    products = {p["id"]: p["name"] for p in api("get", "/objects/products")}
+    products = {p["id"]: p for p in api("get", "/objects/products")}
     sections = {s["id"]: s["name"] for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")}
+    units = {u["id"]: u["name"] for u in (api("get", "/objects/quantity_units") or []) if u.get("name")}
 
     today = datetime.now().date()
+    start = today - timedelta(days=days_back)
     cutoff = today + timedelta(days=days_ahead)
 
     out = []
@@ -1133,20 +1150,36 @@ def get_meal_plan(days_ahead: int = 7) -> list[dict]:
             day = datetime.strptime(day_str, "%Y-%m-%d").date()
         except ValueError:
             continue
-        if day < today or day > cutoff:
+        if day < start or day > cutoff:
             continue
         item: dict = {"date": day_str}
         if e.get("section_id") and e["section_id"] in sections:
             item["section"] = sections[e["section_id"]]
         if e.get("recipe_id"):
+            item["type"] = "recipe"
             item["recipe"] = recipes.get(e["recipe_id"], f"recipe_{e['recipe_id']}")
         elif e.get("product_id"):
-            item["product"] = products.get(e["product_id"], f"product_{e['product_id']}")
+            item["type"] = "product"
+            product = products.get(e["product_id"], {})
+            item["product"] = product.get("name", f"product_{e['product_id']}")
+            if e.get("product_amount") is not None:
+                item["amount"] = float(e["product_amount"])
+            unit_id = e.get("product_qu_id") or product.get("qu_id_stock")
+            if unit_id in units:
+                item["unit"] = units[unit_id]
         elif e.get("note"):
+            item["type"] = "note"
             item["note"] = e["note"]
         out.append(item)
 
-    return sorted(out, key=lambda x: x["date"])
+    return sorted(
+        out,
+        key=lambda x: (
+            x["date"],
+            x.get("section", ""),
+            x.get("recipe") or x.get("product") or x.get("note", ""),
+        ),
+    )
 
 
 @mcp.tool
@@ -1229,26 +1262,103 @@ def add_product_to_meal_plan(product_name: str, date: str, section: str, amount:
 
 
 @mcp.tool
-def delete_meal_plan_entry(date: str, recipe_name: str) -> str:
-    """Remove a recipe from the meal plan on a given date.
+def delete_meal_plan_entry(
+    date: str,
+    recipe_name: str,
+    entry_type: Optional[str] = None,
+    section: Optional[str] = None,
+) -> str:
+    """Remove a recipe or product from the meal plan on a given date.
 
     Args:
         date: Date in YYYY-MM-DD format
-        recipe_name: Name of the recipe to remove
+        recipe_name: Name of the recipe or product to remove
+        entry_type: Optional explicit type: 'recipe' or 'product'
+        section: Optional meal section to disambiguate entries
     """
+    entries = api("get", "/objects/meal_plan") or []
+    section_rows = [s for s in (api("get", "/objects/meal_plan_sections") or []) if s.get("name")]
+    sections = {s["name"].lower(): s for s in section_rows}
+    sections_by_id = {s["id"]: s["name"] for s in section_rows}
+
+    section_id: Optional[int] = None
+    section_label: Optional[str] = None
+    if section:
+        matched_section = sections.get(section.lower())
+        if matched_section is None:
+            raise ValueError(f"Unknown section '{section}'. Available: {list(sections.keys())}")
+        section_id = matched_section["id"]
+        section_label = matched_section["name"]
+
+    requested_type = entry_type.lower() if entry_type else None
+    if requested_type not in {None, "recipe", "product"}:
+        raise ValueError("entry_type must be 'recipe' or 'product'")
+
     recipe = _recipe_by_name(recipe_name)
-    if not recipe:
-        return f"Recipe '{recipe_name}' not found."
-    entries = api("get", "/objects/meal_plan")
-    to_delete = [
-        e for e in entries
-        if (e.get("day") or "")[:10] == date and str(e.get("recipe_id")) == str(recipe["id"])
-    ]
+    product_id, product_matches = _find_product(recipe_name)
+
+    if requested_type is None:
+        if recipe and product_id:
+            return (
+                f"'{recipe_name}' matches both a recipe and a product. "
+                "Pass entry_type='recipe' or entry_type='product'."
+            )
+        if recipe:
+            requested_type = "recipe"
+        elif product_id:
+            requested_type = "product"
+        elif product_matches:
+            return f"Ambiguous product '{recipe_name}': {[m['name'] for m in product_matches[:5]]}"
+        else:
+            return f"'{recipe_name}' not found as a recipe or product."
+
+    if requested_type == "recipe":
+        if not recipe:
+            return f"Recipe '{recipe_name}' not found."
+        to_delete = [
+            e for e in entries
+            if (e.get("day") or "")[:10] == date and str(e.get("recipe_id")) == str(recipe["id"])
+        ]
+    else:
+        if not product_id:
+            if product_matches:
+                return f"Ambiguous product '{recipe_name}': {[m['name'] for m in product_matches[:5]]}"
+            return f"Product '{recipe_name}' not found."
+        to_delete = [
+            e for e in entries
+            if (e.get("day") or "")[:10] == date and str(e.get("product_id")) == str(product_id)
+        ]
+
+    if section_id is not None:
+        to_delete = [e for e in to_delete if e.get("section_id") == section_id]
+
     if not to_delete:
-        return f"No entry for '{recipe_name}' on {date}."
+        if section_label:
+            return f"No {requested_type} entry for '{recipe_name}' on {date} [{section_label}]."
+        return f"No {requested_type} entry for '{recipe_name}' on {date}."
+
+    if section_id is None:
+        distinct_sections = {e.get("section_id") for e in to_delete if e.get("section_id") is not None}
+        if len(distinct_sections) > 1:
+            available = sorted(
+                {
+                    sections_by_id[sid]
+                    for sid in distinct_sections
+                    if sid is not None and sid in sections_by_id
+                }
+            )
+            return (
+                f"Multiple {requested_type} entries for '{recipe_name}' exist on {date}. "
+                f"Specify section. Available: {available}"
+            )
+
     for e in to_delete:
         api("delete", f"/objects/meal_plan/{e['id']}")
-    return f"Removed '{recipe_name}' from {date}."
+    if not section_label and to_delete[0].get("section_id") in sections_by_id:
+        section_label = sections_by_id[to_delete[0]["section_id"]]
+    if section_label:
+        return f"Removed {requested_type} '{recipe_name}' from {date} [{section_label}]."
+    return f"Removed {requested_type} '{recipe_name}' from {date}."
 
 
 # ---------------------------------------------------------------------------

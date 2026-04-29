@@ -19,9 +19,10 @@ A minimal, AI-friendly MCP server for [Grocy](https://grocy.info/). Built with [
 | `update_recipe` | Update name/servings/ingredients/description |
 | `cook_recipe` | Mark cooked — auto-consumes stock |
 | `add_missing_to_shopping_list` | Add missing recipe ingredients to shopping list |
-| `get_meal_plan` | Meal plan for next N days |
+| `get_meal_plan` | Meal plan around today, with optional lookback for past corrections |
 | `add_to_meal_plan` | Schedule a recipe |
-| `delete_meal_plan_entry` | Remove from meal plan |
+| `add_product_to_meal_plan` | Schedule a standalone product such as a snack or drink |
+| `delete_meal_plan_entry` | Remove a recipe or product from the meal plan |
 | `get_shopping_list` | Current shopping list |
 | `add_to_shopping_list` | Add item |
 | `remove_from_shopping_list` | Remove item |
