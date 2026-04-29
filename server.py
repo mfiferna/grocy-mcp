@@ -1465,6 +1465,38 @@ def _from_stock_amount(stock_amount: float, stock_unit: str, display_unit: str) 
     return stock_amount
 
 
+def _nutrition_totals_for_product_amount(
+    product: dict,
+    amount: float,
+    amount_unit_name: str,
+    units_map: dict,
+    userfields: dict,
+) -> Optional[dict]:
+    """Calculate nutrition totals for a product amount, or None when no nutrition data exists."""
+    stock_unit_name = _product_unit_name(product, units_map)
+    stock_amount = _to_stock_amount(amount, amount_unit_name or stock_unit_name, stock_unit_name)
+    stock_gpunit = _grams_per_unit(stock_unit_name)
+
+    cal = product.get("calories")
+    prot = userfields.get("protein_g")
+    carb = userfields.get("carbs_g")
+    fat = userfields.get("fat_g")
+
+    if all(value in (None, "") for value in (cal, prot, carb, fat)):
+        return None
+
+    totals = {"calories_kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+    totals["calories_kcal"] += float(cal or 0) * stock_amount
+    if stock_gpunit:
+        macro_factor = stock_amount * stock_gpunit / 100.0
+    else:
+        macro_factor = stock_amount
+    totals["protein_g"] += float(prot or 0) * macro_factor
+    totals["carbs_g"] += float(carb or 0) * macro_factor
+    totals["fat_g"] += float(fat or 0) * macro_factor
+    return totals
+
+
 @mcp.tool
 def get_nutrition(product_name: str) -> dict:
     """Get nutrition info (calories, protein, carbs, fat per 100g) for a product.
@@ -1696,6 +1728,37 @@ def get_day_nutrition(date: str) -> dict:
         return {"date": date, "error": "No meal plan entries for this date."}
 
     for entry in day_entries:
+        if entry.get("product_id"):
+            pid = entry["product_id"]
+            product = products_map.get(pid)
+            if not product:
+                continue
+            amount = float(entry.get("product_amount") or 0)
+            amount_unit_name = units_map.get(entry.get("product_qu_id")) or _product_unit_name(product, units_map)
+            userfields = api("get", f"/userfields/products/{pid}") or {}
+            product_totals = _nutrition_totals_for_product_amount(
+                product,
+                amount,
+                amount_unit_name,
+                units_map,
+                userfields,
+            )
+            if product_totals is None:
+                no_data.append(product.get("name", f"product_{pid}"))
+                continue
+
+            for k in totals:
+                totals[k] += product_totals[k]
+            breakdown.append(
+                {
+                    "type": "product",
+                    "item": product["name"],
+                    "product": product["name"],
+                    **{k: round(v, 1) for k, v in product_totals.items()},
+                }
+            )
+            continue
+
         if not entry.get("recipe_id"):
             continue
         recipe = recipes_map.get(entry["recipe_id"])
@@ -1712,35 +1775,30 @@ def get_day_nutrition(date: str) -> dict:
             pid = pos.get("product_id")
             amount = float(pos.get("amount", 0)) * scale
             product = products_map.get(pid, {})
-            stock_unit_name = _product_unit_name(product, units_map)
-            stock_gpunit = _grams_per_unit(stock_unit_name)
             userfields = api("get", f"/userfields/products/{pid}") or {}
-
-            cal = product.get("calories")
-            prot = userfields.get("protein_g")
-            carb = userfields.get("carbs_g")
-            fat = userfields.get("fat_g")
-
-            if cal is None and prot is None:
+            item_totals = _nutrition_totals_for_product_amount(
+                product,
+                amount,
+                _product_unit_name(product, units_map),
+                units_map,
+                userfields,
+            )
+            if item_totals is None:
                 no_data.append(product.get("name", f"product_{pid}"))
                 continue
-
-            if stock_gpunit:
-                # amount is in stock units; cal is kcal/stock_unit
-                recipe_totals["calories_kcal"] += float(cal or 0) * amount
-                # macros stored per 100g: convert stock-unit amount to grams
-                macro_factor = amount * stock_gpunit / 100.0
-            else:
-                # Discrete unit (piece): kcal/piece stored directly
-                recipe_totals["calories_kcal"] += float(cal or 0) * amount
-                macro_factor = amount
-            recipe_totals["protein_g"] += float(prot or 0) * macro_factor
-            recipe_totals["carbs_g"] += float(carb or 0) * macro_factor
-            recipe_totals["fat_g"] += (float(fat or 0)) * macro_factor
+            for k in recipe_totals:
+                recipe_totals[k] += item_totals[k]
 
         for k in totals:
             totals[k] += recipe_totals[k]
-        breakdown.append({"recipe": recipe["name"], **{k: round(v, 1) for k, v in recipe_totals.items()}})
+        breakdown.append(
+            {
+                "type": "recipe",
+                "item": recipe["name"],
+                "recipe": recipe["name"],
+                **{k: round(v, 1) for k, v in recipe_totals.items()},
+            }
+        )
 
     result: dict = {
         "date": date,
@@ -1748,7 +1806,7 @@ def get_day_nutrition(date: str) -> dict:
         "breakdown": breakdown,
     }
     if no_data:
-        result["missing_nutrition_data"] = list(set(no_data))
+        result["missing_nutrition_data"] = sorted(set(no_data))
     return result
 
 
